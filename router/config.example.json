@@ -1,0 +1,26 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 11400 },
+  "upstreamTimeoutMs": 900000,
+  "modelsTtlMs": 30000,
+  "backends": [
+    {
+      "name": "codex",
+      "baseUrl": "http://127.0.0.1:11435/v1",
+      "models": ["gpt-6-luna"],
+      "apiKeyEnv": "CODEX_PROXY_SHARED_SECRET"
+    },
+    {
+      "name": "claude",
+      "baseUrl": "http://127.0.0.1:11446/v1",
+      "models": ["claude-opus-5", "claude-opus-5-5"],
+      "aliases": ["opus"],
+      "discoverModels": true,
+      "apiKeyEnv": "CLAUDE_PROXY_SHARED_SECRET"
+    },
+    {
+      "name": "ollama",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "discoverModels": true
+    }
+  ]
+}

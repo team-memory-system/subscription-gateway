@@ -1,0 +1,12 @@
+{
+  "name": "codex-openai-proxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test server.test.mjs"
+  },
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.70.2"
+  }
+}
