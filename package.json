@@ -3,7 +3,8 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "test": "node --test codex-openai-proxy/server.test.mjs claude-print-proxy/server.test.mjs router/server.test.mjs && python3 -m unittest test_proxyctl.py",
-    "status": "python3 proxyctl.py status"
+    "test": "node --test codex-openai-proxy/server.test.mjs claude-print-proxy/server.test.mjs router/server.test.mjs ui/server.test.mjs && python3 -m unittest test_proxyctl.py",
+    "status": "python3 proxyctl.py status",
+    "ui": "node ui/server.mjs"
   }
 }

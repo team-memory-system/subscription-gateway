@@ -361,3 +361,19 @@ test('OAuth retries once when another process rotates auth during a failed refre
   assert.equal(await manager.getAccessToken(), 'winner-access');
   assert.equal(calls, 2);
 });
+
+test('the model list names what the adapter has metadata for, and requires the key', async () => {
+  const { listModels } = await import('./server.mjs');
+  const models = listModels();
+  assert.ok(models.length >= 2, 'the catalog should contribute more than the default alone');
+  for (const entry of models) {
+    assert.equal(entry.object, 'model');
+    assert.equal(entry.owned_by, 'openai-codex');
+    assert.equal(typeof entry.id, 'string');
+    assert.ok(entry.id.length > 0);
+  }
+  const ids = models.map(entry => entry.id);
+  assert.deepEqual(ids, [...ids].sort(), 'a stable order keeps a dispatcher cache from thrashing');
+  assert.equal(new Set(ids).size, ids.length, 'no duplicates when the default is already in the catalog');
+  assert.ok(ids.includes(process.env.DEFAULT_CODEX_MODEL || 'gpt-5.5'));
+});

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { getModel, stream as piStream } from '@mariozechner/pi-ai';
+import { getModel, getModels, stream as piStream } from '@mariozechner/pi-ai';
 import { getOAuthApiKey } from '@mariozechner/pi-ai/oauth';
 
 const PORT = Number(process.env.PORT || 11435);
@@ -742,10 +742,32 @@ async function handleChatCompletions(req, res) {
   });
 }
 
+// The models this adapter has metadata for, which is what a dispatcher in front of
+// it can route by. A name outside this list is still forwarded when a request
+// names it explicitly; handleChatCompletions falls back to the default model's
+// shape. Listing only what is known keeps the reply from claiming more than it can
+// describe.
+export function listModels() {
+  const catalog = getModels(PROVIDER_ID);
+  const entries = Array.isArray(catalog) ? catalog : Object.values(catalog || {});
+  const ids = new Set();
+  for (const entry of entries) {
+    const id = entry && (entry.id || entry.slug);
+    if (typeof id === 'string' && id) ids.add(id);
+  }
+  ids.add(DEFAULT_MODEL);
+  return [...ids].sort().map(id => ({ id, object: 'model', owned_by: PROVIDER_ID }));
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/health') {
       return sendJson(res, 200, { status: 'ok', provider: PROVIDER_ID, default_model: DEFAULT_MODEL });
+    }
+
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      if (!authorized(req)) return sendJson(res, 401, { error: 'Unauthorized' });
+      return sendJson(res, 200, { object: 'list', data: listModels() });
     }
 
     if (req.method === 'POST' && req.url === '/v1/chat/completions') {
