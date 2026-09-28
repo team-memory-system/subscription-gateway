@@ -17,7 +17,11 @@ class InstallTest(unittest.TestCase):
             folder.mkdir()
             p = patch.object(proxyctl, key, folder)
             p.start(); self.addCleanup(p.stop)
-        self.label, self.legacy, _, _ = proxyctl.SERVICES['codex']
+        # Migration only happens for an installation that names its older label.
+        p = patch.object(proxyctl, 'LEGACY_PREFIX', 'com.example.old-gateway')
+        p.start(); self.addCleanup(p.stop)
+        self.label, _, _ = proxyctl.SERVICES['codex']
+        self.legacy = proxyctl.legacy_label('codex')
         self.old = proxyctl.AGENTS / (self.legacy + '.plist')
         self.previous = plistlib.dumps({'Label': self.legacy, 'ProgramArguments':['node','old.mjs'], 'EnvironmentVariables':{'PORT':'11435', 'CODEX_PROXY_SHARED_SECRET':'test-secret'}})
         self.old.write_bytes(self.previous)
@@ -41,5 +45,23 @@ class InstallTest(unittest.TestCase):
             with self.assertRaises(SystemExit): proxyctl.install('codex')
         self.assertEqual(self.old.read_bytes(), self.previous)
         self.assertFalse((proxyctl.AGENTS/(self.label+'.plist')).exists())
+
+    def test_a_new_computer_has_no_legacy_label_to_adopt(self):
+        # The default: nothing to migrate from, so install must not look for, boot
+        # out, or delete a plist named after the label it is about to write.
+        stop = patch.object(proxyctl, 'LEGACY_PREFIX', '')
+        stop.start(); self.addCleanup(stop.stop)
+        self.assertEqual(proxyctl.legacy_label('codex'), '')
+        self.old.unlink()
+        with patch.object(proxyctl, 'launch') as launch, patch.object(proxyctl.urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps({'status':'ok'}).encode())), patch('sys.stdout', new_callable=io.StringIO):
+            launch.return_value.returncode = 0
+            proxyctl.install('codex')
+        target = proxyctl.AGENTS / (self.label + '.plist')
+        self.assertTrue(target.exists())
+        data = plistlib.loads(target.read_bytes())
+        self.assertEqual(data['Label'], self.label)
+        self.assertEqual(data['EnvironmentVariables']['PORT'], '11435')
+        booted_out = [call.args for call in launch.call_args_list if call.args[0] == 'bootout']
+        self.assertEqual(booted_out, [('bootout', f'gui/{proxyctl.os.getuid()}/{self.label}')])
 
 if __name__ == '__main__': unittest.main()

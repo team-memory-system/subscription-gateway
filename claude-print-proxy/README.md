@@ -6,8 +6,8 @@ request. Requires an authenticated Claude Code CLI (2.1.272 or later).
 ## Operation
 
 Use `python3 ../proxyctl.py install|status|restart|logs claude` from this folder.
-On this Mac the port is 11446, label is `com.chenjing.llm-proxy.claude`, and logs
-are in `~/.local/share/llm-proxy/logs/`. Direct `node server.mjs` defaults to 11436;
+The installed service defaults to port 11446 with the label `subscription-gateway.claude`, and logs
+are in `~/.local/share/subscription-gateway/logs/`. Direct `node server.mjs` defaults to 11436;
 set PORT=11446 for the managed configuration.
 
 ## Model and request behavior

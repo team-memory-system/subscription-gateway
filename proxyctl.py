@@ -11,22 +11,34 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
-STATE = Path.home() / '.local/share/llm-proxy'
+# Labels and the state directory are per-installation, so they are not written
+# into this file. An install migrates from whatever label it finds in LEGACY.
+PREFIX = os.environ.get('GATEWAY_LAUNCHD_PREFIX', 'subscription-gateway')
+STATE = Path(os.environ.get('GATEWAY_STATE_DIR', Path.home() / '.local/share/subscription-gateway'))
 AGENTS = Path.home() / 'Library/LaunchAgents'
+# An installation that already runs these services under an older label sets
+# GATEWAY_LEGACY_LAUNCHD_PREFIX so `install` adopts and replaces it. Empty means
+# there is nothing to migrate from, which is the case on a new computer.
+LEGACY_PREFIX = os.environ.get('GATEWAY_LEGACY_LAUNCHD_PREFIX', '').strip()
 SERVICES = {
-    'codex': ('com.chenjing.llm-proxy.codex', 'com.chenjing.honcho-codex-openai-proxy', 'codex-openai-proxy', 11435),
-    'claude': ('com.chenjing.llm-proxy.claude', 'com.chenjing.claude-print-proxy', 'claude-print-proxy', 11446),
-    'router': ('com.chenjing.llm-proxy.router', 'com.chenjing.llm-router', 'router', 11400),
+    'codex': (f'{PREFIX}.codex', 'codex-openai-proxy', 11435),
+    'claude': (f'{PREFIX}.claude', 'claude-print-proxy', 11446),
+    'router': (f'{PREFIX}.router', 'router', 11400),
 }
+
+def legacy_label(name):
+    """The label an earlier install of this service used, or '' when there is none."""
+    return f'{LEGACY_PREFIX}.{name}' if LEGACY_PREFIX else ''
 
 def launch(*args, check=True):
     return subprocess.run(['launchctl', *args], check=check, capture_output=True, text=True)
 
 def install(name):
-    label, legacy, directory, port = SERVICES[name]
+    label, directory, port = SERVICES[name]
+    legacy = legacy_label(name)
     target = AGENTS / (label + '.plist')
-    old = AGENTS / (legacy + '.plist')
-    existing = target if target.exists() else old
+    old = AGENTS / (legacy + '.plist') if legacy else None
+    existing = target if target.exists() or not old else old
     previous = existing.read_bytes() if existing.exists() else None
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     (STATE/'logs').mkdir(exist_ok=True, mode=0o700)
@@ -50,7 +62,7 @@ def install(name):
     with os.fdopen(fd, 'wb') as f: f.write(plistlib.dumps(data))
     domain = f'gui/{os.getuid()}'
     launch('bootout', f'{domain}/{label}', check=False)
-    launch('bootout', f'{domain}/{legacy}', check=False)
+    if legacy: launch('bootout', f'{domain}/{legacy}', check=False)
     tmp.replace(target)
     result = launch('bootstrap', domain, str(target), check=False)
     healthy = False
@@ -72,7 +84,7 @@ def install(name):
             existing.chmod(0o600)
             launch('bootstrap', domain, str(existing), check=False)
         raise SystemExit(f'{name}: startup health check failed; previous configuration restored')
-    if old.exists(): old.unlink()
+    if old and old.exists(): old.unlink()
     print(f'{name}: installed {label}')
 
 def main():
@@ -81,7 +93,7 @@ def main():
     ap.add_argument('service', choices=['all', *SERVICES], nargs='?', default='all')
     args = ap.parse_args()
     for name in SERVICES if args.service == 'all' else [args.service]:
-        label, _, _, port = SERVICES[name]
+        label, _, port = SERVICES[name]
         target = f'gui/{os.getuid()}/{label}'
         if args.command == 'install': install(name)
         elif args.command == 'status':

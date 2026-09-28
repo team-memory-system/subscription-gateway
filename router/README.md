@@ -47,7 +47,7 @@ A backend that requires a key needs that key in the router's own environment,
 which a fresh install does not provide. Add the variables named by the
 backends' `apiKeyEnv` (`CODEX_PROXY_SHARED_SECRET`, `CLAUDE_PROXY_SHARED_SECRET`)
 to `EnvironmentVariables` in
-`~/Library/LaunchAgents/com.chenjing.llm-proxy.router.plist` and re-run
+`~/Library/LaunchAgents/subscription-gateway.router.plist` and re-run
 `python3 ../proxyctl.py install router`; the install preserves the environment
 it finds. Without them the router forwards unauthenticated and the backend
 answers 401.

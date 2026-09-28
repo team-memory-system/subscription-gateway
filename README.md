@@ -12,7 +12,7 @@ One of three repositories in the memory system.
 |---|---|---|
 | [`honcho-selfhost`](https://github.com/team-memory-system/honcho-selfhost) | The memory server, a fork of `plastic-labs/honcho` (AGPL-3.0) | One computer per person |
 | [`honcho-agent-bridge`](https://github.com/team-memory-system/honcho-agent-bridge) | Collector, installer, agent plugin | Every machine that runs an agent |
-| **`llm-proxy`** (this one) | Subscription-to-API adapters and a router | Only the computer that runs Honcho |
+| **`subscription-gateway`** (this one) | Subscription-to-API adapters and a router | Only the computer that runs Honcho |
 
 ### Why these cannot move into Docker
 
@@ -28,7 +28,7 @@ This keeps coming up, so: they are on the host because they reach host-only thin
 
 Two things can, and they are separate:
 
-- `proxyctl.py` — macOS LaunchAgents, `com.chenjing.llm-proxy.*`. This is what runs
+- `proxyctl.py` — macOS LaunchAgents, `subscription-gateway.*`. This is what runs
   on the owner's machine today. It preserves an existing plist's OAuth source and
   shared keys, and never copies credentials into this repository.
 - `honcho-agent-bridge`'s `scripts/host-manager.mjs` — cross-platform, spawns a
@@ -90,9 +90,9 @@ python3 proxyctl.py start claude
 ```
 
 Installation migrates existing LaunchAgents while retaining their environment
-and shared keys. Labels: `com.chenjing.llm-proxy.codex` and
-`com.chenjing.llm-proxy.claude`. Configuration lives in `~/Library/LaunchAgents/`;
-logs and migration backups live in `~/.local/share/llm-proxy/`.
+and shared keys. Labels: `subscription-gateway.codex` and
+`subscription-gateway.claude`. Configuration lives in `~/Library/LaunchAgents/`;
+logs and migration backups live in `~/.local/share/subscription-gateway/`.
 Credentials, installed plists, and backups must never enter a release archive.
 Fresh installations bind to loopback only. Configure shared client keys using
 `CODEX_PROXY_SHARED_SECRET` and `CLAUDE_PROXY_SHARED_SECRET` in the installed
@@ -128,4 +128,4 @@ not implemented. Existing OAuth credentials were not copied or reissued.
 Extracted on 2026-09-23 from the Honcho checkout's `codex-openai-proxy/` and
 `claude-print-proxy/`. The original LICENSE is preserved. Source revision is
 recorded in ORIGIN.txt. Original sources and installed plist backups are retained
-outside the repository under `~/.local/share/llm-proxy/backups/`.
+outside the repository under `~/.local/share/subscription-gateway/backups/`.
