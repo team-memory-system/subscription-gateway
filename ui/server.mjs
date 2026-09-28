@@ -108,6 +108,7 @@ export async function statusReport({ paths = gatewayPaths(), env = process.env, 
   if (router?.running) {
     models = await routerModels({ secrets, env, fetchImpl });
   }
+  const adaptersUp = services.filter(entry => entry.name !== "router" && entry.running).map(entry => entry.name);
   return {
     ok: true,
     appHome: paths.appHome,
@@ -116,6 +117,11 @@ export async function statusReport({ paths = gatewayPaths(), env = process.env, 
     services,
     models,
     ready: enabledBackends(logins).length > 0,
+    // The one address anything else should be pointed at, and whether it is
+    // actually answering for at least one backend right now.
+    endpoint: `${serviceUrl(service("router"), env)}/v1`,
+    connected: Boolean(router?.running) && adaptersUp.length > 0,
+    servingBackends: adaptersUp,
   };
 }
 
@@ -190,9 +196,44 @@ function firstLine(text) {
   return String(text || "").trim().split(/\r?\n/)[0].slice(0, 400);
 }
 
-async function applyRouterConfig({ paths, env, fetchImpl }) {
-  const logins = await Promise.all(BACKENDS.map(entry => loginStatus(entry.name, { paths, env })));
-  const backends = logins.filter(entry => entry.loggedIn).map(entry => entry.backend);
+/**
+ * Everything a login should have caused. Logging in is the only decision a person
+ * makes here; which processes that implies, and the order they have to come up in,
+ * is this file's problem, not theirs.
+ *
+ * The router is restarted rather than left alone because it reads its backend list
+ * once at startup: a backend logged in afterwards would be invisible to it.
+ */
+export async function connect({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, runner, starter = startService, stopper = stopService } = {}) {
+  const ask = runner ? { paths, env, runner } : { paths, env };
+  const logins = await Promise.all(BACKENDS.map(entry => loginStatus(entry.name, ask)));
+  const ready = logins.filter(entry => entry.loggedIn).map(entry => entry.backend);
+  if (!ready.length) {
+    return { ok: false, error: "로그인된 것이 없습니다. 먼저 로그인하세요", steps: [] };
+  }
+  const { secrets } = await loadSecrets({ paths });
+  const steps = [];
+  for (const name of ready) {
+    const result = await starter(name, { secrets, paths, env, fetchImpl });
+    steps.push({ service: name, ok: result.ok, alreadyRunning: Boolean(result.alreadyRunning), error: result.error });
+  }
+  const applied = await applyRouterConfig({ backends: ready, paths, env });
+  if (!applied.ok) return { ok: false, error: applied.error, steps };
+  // Stop first: a router already up is holding the previous backend list.
+  await stopper("router", { paths, env, fetchImpl });
+  const router = await starter("router", { secrets, paths, env, fetchImpl });
+  steps.push({ service: "router", ok: router.ok, error: router.error });
+  const failed = steps.filter(step => !step.ok);
+  return {
+    ok: failed.length === 0,
+    connected: ready,
+    steps,
+    ...(failed.length ? { error: failed.map(step => step.error || `${step.service}를 시작하지 못했습니다`).join(" / ") } : {}),
+  };
+}
+
+/** Takes the backend list its caller already established rather than asking again. */
+async function applyRouterConfig({ backends, paths, env }) {
   if (!backends.length) {
     return { ok: false, error: "로그인된 백엔드가 없습니다. 먼저 로그인하세요" };
   }
@@ -200,6 +241,12 @@ async function applyRouterConfig({ paths, env, fetchImpl }) {
   const config = routerConfig({ backends, env, ollamaBaseUrl });
   const file = await writeRouterConfig(config, { paths });
   return { ok: true, backends, configPath: file };
+}
+
+async function loggedInBackends({ paths, env, runner }) {
+  const ask = runner ? { paths, env, runner } : { paths, env };
+  const logins = await Promise.all(BACKENDS.map(entry => loginStatus(entry.name, ask)));
+  return logins.filter(entry => entry.loggedIn).map(entry => entry.backend);
 }
 
 export function createHandler({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, port } = {}) {
@@ -240,14 +287,20 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
         const result = await logout(String(body.backend || ""), { paths, env });
         return json(res, result.ok ? 200 : 400, result);
       }
+      if (req.method === "POST" && url.pathname === "/api/connect") {
+        const result = await connect({ paths, env, fetchImpl });
+        return json(res, result.ok ? 200 : 400, result);
+      }
       if (req.method === "POST" && url.pathname === "/api/router-config") {
-        return json(res, 200, await applyRouterConfig({ paths, env, fetchImpl }));
+        const backends = await loggedInBackends({ paths, env });
+        return json(res, 200, await applyRouterConfig({ backends, paths, env }));
       }
       if (req.method === "POST" && url.pathname === "/api/start") {
         const name = String(body.service || "");
         const { secrets } = await loadSecrets({ paths });
         if (name === "router") {
-          const applied = await applyRouterConfig({ paths, env, fetchImpl });
+          const backends = await loggedInBackends({ paths, env });
+          const applied = await applyRouterConfig({ backends, paths, env });
           if (!applied.ok) return json(res, 400, applied);
         }
         const result = await startService(name, { secrets, paths, env, fetchImpl });

@@ -132,3 +132,35 @@ form button { justify-self: start; }
   background: var(--panel);
   font-size: 13.5px;
 }
+
+#endpoint-card { gap: 10px; }
+.headline { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 600; flex-wrap: wrap; }
+.endpoint {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.endpoint code {
+  font-family: var(--mono);
+  font-size: 14px;
+  background: var(--ground);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 7px 11px;
+  flex: 1 1 260px;
+  word-break: break-all;
+}
+details#detail-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 14px 18px;
+}
+details#detail-card > summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.detail-body { display: grid; gap: 10px; padding-top: 12px; }

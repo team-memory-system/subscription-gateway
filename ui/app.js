@@ -46,6 +46,8 @@ function button(text, className, handler) {
   return node;
 }
 
+const BACKEND_LABEL = { codex: "Codex", claude: "Claude" };
+
 function loginRow(entry) {
   const row = el("div", "row");
   row.append(el("div", "name", entry.label));
@@ -54,24 +56,25 @@ function loginRow(entry) {
   if (entry.method) parts.push(entry.method);
   if (entry.plan) parts.push(entry.plan);
   if (entry.account) parts.push(entry.account);
-  if (!entry.cliAvailable) parts.push(entry.error || "명령을 찾을 수 없습니다");
+  if (!entry.cliAvailable) parts.push(entry.error || `${entry.backend} 명령을 찾을 수 없습니다`);
   else if (entry.error) parts.push(entry.error);
-  parts.push(entry.directory);
   row.append(el("div", "detail", parts.join("  ·  ")));
 
   const buttons = el("div", "buttons");
   if (entry.loggedIn) {
     buttons.append(button("로그아웃", "", async () => {
       const result = await call("/api/logout", { backend: entry.backend });
-      say(result.ok ? "" : result.error || "로그아웃하지 못했습니다");
-      await refresh();
+      if (!result.ok) return say(result.error || "로그아웃하지 못했습니다");
+      // What was serving this backend has to go with it.
+      await call("/api/stop", { service: entry.backend });
+      await connectNow({ quiet: true });
     }));
   } else if (entry.cliAvailable) {
     buttons.append(button("로그인", "primary", async () => {
       const result = await call("/api/login", { backend: entry.backend });
       if (!result.ok) return say(result.error || "로그인을 시작하지 못했습니다");
-      say(`${entry.label} 로그인을 브라우저에서 끝내 주세요. 끝나면 이 화면이 알아서 바뀝니다.`);
-      watchFor(() => entry.backend);
+      say(`${entry.label} 로그인을 브라우저에서 끝내 주세요. 끝나면 알아서 연결합니다.`);
+      watchFor(entry.backend);
     }));
   }
   row.append(buttons);
@@ -85,18 +88,23 @@ function serviceRow(entry) {
   const parts = [entry.url];
   if (entry.running && !entry.managed) parts.push("이 화면이 시작한 것이 아닙니다");
   if (!entry.dependenciesReady) parts.push("의존성 미설치");
-  if (!entry.running && entry.health && entry.health.error) parts.push(entry.health.error);
+  // A stopped service has nothing listening, and the badge already says so. The
+  // probe's own words are only worth showing when we started it and it still
+  // will not answer, which is a different problem from "not started".
+  if (!entry.running && entry.managed && entry.health && entry.health.error) {
+    parts.push(`시작했지만 응답이 없습니다: ${entry.health.error}`);
+  }
   row.append(el("div", "detail", parts.join("  ·  ")));
 
   const buttons = el("div", "buttons");
   if (entry.running) {
     buttons.append(button("정지", "", async () => {
       const result = await call("/api/stop", { service: entry.name });
-      say(result.ok ? "" : result.error || (result.unmanaged ? "이 화면이 시작하지 않은 서비스라서 정지할 수 없습니다" : "정지하지 못했습니다"));
+      say(result.ok ? "" : result.error || "정지하지 못했습니다");
       await refresh();
     }));
   } else {
-    buttons.append(button("시작", "primary", async () => {
+    buttons.append(button("시작", "", async () => {
       const result = await call("/api/start", { service: entry.name });
       say(result.ok ? "" : result.error || "시작하지 못했습니다");
       await refresh();
@@ -114,7 +122,7 @@ function renderModels(models) {
     return [];
   }
   if (!models.models.length) {
-    target.append(el("p", "muted", "라우터가 아는 모델이 없습니다. 백엔드가 모델 목록을 내주는지 보세요."));
+    target.append(el("p", "muted", "라우터가 아는 모델이 없습니다."));
     return [];
   }
   for (const model of models.models) {
@@ -141,12 +149,31 @@ function fillModelChoices(ids) {
   document.getElementById("chat-send").disabled = empty;
 }
 
+function renderHeadline(report) {
+  const badge = document.getElementById("connect-badge");
+  const text = document.getElementById("connect-text");
+  document.getElementById("endpoint-url").textContent = report.endpoint;
+  if (report.connected) {
+    badge.className = "badge on";
+    badge.textContent = "연결됨";
+    const names = report.servingBackends.map(name => BACKEND_LABEL[name] || name).join(", ");
+    text.textContent = `${names} 로 답합니다`;
+    return;
+  }
+  badge.className = "badge off";
+  badge.textContent = "연결 안 됨";
+  text.textContent = report.ready
+    ? "로그인은 돼 있는데 아직 안 떴습니다. 자세히에서 이유를 볼 수 있습니다"
+    : "아래에서 로그인하세요";
+}
+
 async function refresh() {
   const report = await call("/api/status");
   if (!report.ok) {
     say(report.error || "상태를 읽지 못했습니다");
     return report;
   }
+  renderHeadline(report);
   document.getElementById("app-home").textContent = report.appHome;
   const logins = document.getElementById("logins");
   logins.textContent = "";
@@ -158,21 +185,30 @@ async function refresh() {
   return report;
 }
 
+/** Logging in is the whole decision; bringing up what it implies is not the user's job. */
+async function connectNow({ quiet = false } = {}) {
+  if (!quiet) say("연결하는 중입니다…");
+  const result = await call("/api/connect");
+  await refresh();
+  if (result.ok) say("");
+  else if (!quiet) say(result.error || "연결하지 못했습니다");
+  return result;
+}
+
 /**
  * A login finishes in the browser, so the screen cannot be told; it has to look.
- * Polling stops as soon as the backend reports a login, and gives up after five
- * minutes so an abandoned login does not leave a timer running.
+ * Once the backend reports a login, connecting follows without another click.
+ * Five minutes and it gives up, so an abandoned login leaves no timer running.
  */
-function watchFor(pickBackend) {
+function watchFor(name) {
   if (polling) clearInterval(polling);
   const deadline = Date.now() + 5 * 60 * 1000;
   polling = setInterval(async () => {
     const report = await refresh();
-    const name = pickBackend();
     if (report.ok && report.logins[name] && report.logins[name].loggedIn) {
       clearInterval(polling);
       polling = null;
-      say("");
+      await connectNow();
       return;
     }
     if (Date.now() > deadline) {
@@ -182,6 +218,22 @@ function watchFor(pickBackend) {
     }
   }, 3000);
 }
+
+document.getElementById("copy-endpoint").addEventListener("click", async (event) => {
+  const address = document.getElementById("endpoint-url").textContent;
+  try {
+    await navigator.clipboard.writeText(address);
+    event.target.textContent = "복사됨";
+    setTimeout(() => { event.target.textContent = "복사"; }, 1500);
+  } catch {
+    // Clipboard access is refused in some browsers; selecting it is the fallback.
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById("endpoint-url"));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+});
 
 document.getElementById("chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();

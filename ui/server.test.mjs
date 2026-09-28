@@ -8,7 +8,7 @@ import { authEnvironment, backend, loginStatus } from "../gateway/auth.mjs";
 import { gatewayPaths } from "../gateway/paths.mjs";
 import { loadSecrets, SECRET_ENV } from "../gateway/secrets.mjs";
 import { routerConfig, serviceEnvironment, service } from "../gateway/services.mjs";
-import { chatTest, createHandler, requestAllowed, statusReport } from "./server.mjs";
+import { chatTest, connect, createHandler, requestAllowed, statusReport } from "./server.mjs";
 
 async function tempPaths(t) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "subscription-gateway-"));
@@ -219,4 +219,36 @@ test("the screen is served, an unknown path is a JSON 404, and a refused request
   });
   await handler(big, oversized);
   assert.equal(oversized.captured.status, 413);
+});
+
+test("logging in is the only decision: connecting brings up what that implies", async (t) => {
+  const { paths } = await tempPaths(t);
+  const loggedOut = async () => ({ stdout: "Not logged in\n", stderr: "" });
+
+  const nothing = await connect({ paths, env: {}, runner: loggedOut, fetchImpl: async () => { throw new Error("down"); } });
+  assert.equal(nothing.ok, false);
+  assert.match(nothing.error, /로그인된 것이 없습니다/);
+  assert.deepEqual(nothing.steps, [], "nothing should be started for a machine with no login");
+
+  // Codex logged in, Claude not: only the one adapter comes up, and the router
+  // is restarted so it reads the new backend list instead of the previous one.
+  const started = [];
+  const stopped = [];
+  const result = await connect({
+    paths,
+    env: {},
+    fetchImpl: async () => { throw new Error("down"); },
+    runner: async (bin, args) => (args[0] === "login"
+      ? { stdout: "Logged in using ChatGPT\n", stderr: "" }
+      : { stdout: JSON.stringify({ loggedIn: false, authMethod: "none" }), stderr: "" }),
+    starter: async (name) => { started.push(name); return { ok: true, status: { name, running: true } }; },
+    stopper: async (name) => { stopped.push(name); return { ok: true }; },
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.connected, ["codex"]);
+  assert.deepEqual(started, ["codex", "router"], "the router must come up after the backend it will route to");
+  assert.deepEqual(stopped, ["router"], "a running router holds the previous backend list");
+
+  const config = JSON.parse(await fsp.readFile(paths.routerConfigFile, "utf8"));
+  assert.deepEqual(config.backends.map(entry => entry.name), ["codex"]);
 });
