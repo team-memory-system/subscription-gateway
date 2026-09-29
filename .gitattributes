@@ -1,0 +1,2 @@
+# Windows shims copied byte for byte, CRLF and all: never convert line endings.
+gateway/test-fixtures/** -text

@@ -39,7 +39,7 @@ set PORT=11446 for the managed configuration.
 |---|---|---|
 | HOST | 127.0.0.1 | Bind address; non-loopback requires a shared key |
 | PORT | 11436 | Managed installation uses 11446 |
-| CLAUDE_BIN | claude | CLI executable |
+| CLAUDE_BIN | claude | CLI executable; on Windows an npm `.cmd` shim is run as the program it starts |
 | CLAUDE_PROXY_MODEL | claude-opus-5-5 | Default model |
 | CLAUDE_PROXY_SHARED_SECRET | empty | Client Bearer key |
 | CLAUDE_PROXY_EFFORT | low | Default reasoning effort |
@@ -64,6 +64,13 @@ which has no parseable reset, so no `retry-after`. The JSON result of
 `claude -p` also carries `api_error_status`; `429` there counts too. "Context
 limit reached" is a prompt that is too big and stays a `502`. This mapping is
 built from the CLI's code, not yet seen on a real exhausted account.
+
+On Windows no text from a request goes on the command line. The prompt is stdin
+on every platform; the system prompt is written to a private file under
+`CLAUDE_PROXY_WORKDIR` and passed as `--system-prompt-file`, and the file is
+removed when the run ends. `--json-schema` has no file form and stays on the
+command line. `claude` is found on PATH with PATHEXT and started as the `.exe` its
+npm shim runs; a `CLAUDE_BIN` that only `cmd.exe` could start is refused with 502.
 
 Request logs contain model, effort, duration, usage, cost, status and counts;
 prompts, response bodies, images and credentials are excluded. Logs are not

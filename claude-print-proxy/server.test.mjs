@@ -13,6 +13,7 @@ import {
   createHandler,
   createSpawnRunner,
   logRequest,
+  stageSystemPrompt,
 } from './server.mjs';
 
 // Every image of a request lands in a private directory under the workdir, so
@@ -1488,4 +1489,112 @@ test('a non-zero exit without a usage limit keeps the 502', async () => {
       error: { message: 'claude exited with code 3: boom', type: 'claude_print_proxy_error' },
     });
   });
+});
+
+// ---------------------------------------------------------------------------
+// Windows: nothing from the request on the command line
+// ---------------------------------------------------------------------------
+
+// A request whose system text would mean something to cmd.exe, and a lot of it.
+const HOSTILE_SYSTEM = `Answer tersely & "exactly" %PATH% ^ | <x> ${'y'.repeat(40_000)}`;
+
+function hostileInvocation() {
+  return buildInvocation({
+    model: 'claude-haiku-4-5',
+    messages: [{ role: 'system', content: HOSTILE_SYSTEM }, { role: 'user', content: 'hello over stdin' }],
+  });
+}
+
+// Records what would have been spawned on Windows and stands in for claude.exe
+// with a real process, which echoes stdin back as the result.
+function windowsSpawn(calls) {
+  return (file, args, options) => {
+    const index = args.indexOf('--system-prompt-file');
+    calls.push({
+      file,
+      args,
+      options,
+      systemPromptOnDisk: index === -1 ? undefined : fs.readFileSync(args[index + 1], 'utf8'),
+    });
+    const script = 'node -e "let s=\'\';process.stdin.on(\'data\',d=>s+=d).on(\'end\',()=>process.stdout.write(JSON.stringify({type:\'result\',is_error:false,result:s})))"';
+    return spawn('sh', ['-c', script], { cwd: options.cwd, env: options.env, stdio: options.stdio });
+  };
+}
+
+test('on Windows the system prompt goes through a private file and the prompt through stdin', async () => {
+  const invocation = hostileInvocation();
+  const calls = [];
+  const resolved = [];
+  const runClaude = createSpawnRunner({
+    claudeBin: 'claude',
+    platform: 'win32',
+    resolveCommand: (bin, args, options) => {
+      resolved.push({ bin, allowShell: options.allowShell });
+      return { file: 'C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe', args };
+    },
+    spawnFn: windowsSpawn(calls),
+  });
+  const before = await workdirEntries();
+  const payload = await runClaude({ args: invocation.args, prompt: invocation.prompt });
+  assert.equal(payload.result, 'hello over stdin');
+
+  assert.deepEqual(resolved, [{ bin: 'claude', allowShell: false }], 'cmd.exe is never an option for these arguments');
+  const [call] = calls;
+  assert.equal(call.file, 'C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe');
+  assert.equal(call.options.windowsHide, true);
+  assert.ok(!call.args.includes('--system-prompt'));
+  assert.ok(!call.args.some((arg) => arg.includes('%PATH%') || arg.includes('hello over stdin')), 'no request text on the command line');
+  assert.equal(call.systemPromptOnDisk, invocation.systemPrompt);
+  assert.equal(argValue(call.args, '--model'), 'claude-haiku-4-5');
+  // Everything else keeps its place and value.
+  const expected = [...invocation.args];
+  expected.splice(expected.indexOf('--system-prompt'), 2, '--system-prompt-file', call.args[call.args.indexOf('--system-prompt-file') + 1]);
+  assert.deepEqual(call.args, expected);
+  assert.deepEqual(await workdirEntries(), before, 'the system prompt file is removed after the run');
+});
+
+test('on Windows a claude only cmd.exe could run is refused, and nothing is left behind', async () => {
+  let spawned = 0;
+  const runClaude = createSpawnRunner({
+    claudeBin: 'claude',
+    platform: 'win32',
+    resolveCommand: () => { throw Object.assign(new Error('C:\\tools\\claude.bat is a batch file'), { code: 'ESHELL' }); },
+    spawnFn: () => { spawned += 1; },
+  });
+  const before = await workdirEntries();
+  const invocation = hostileInvocation();
+  await assert.rejects(runClaude({ args: invocation.args, prompt: invocation.prompt }), (error) => {
+    assert.equal(error.statusCode, 502);
+    assert.match(error.message, /Failed to start claude: .*batch file/);
+    return true;
+  });
+  assert.equal(spawned, 0);
+  assert.deepEqual(await workdirEntries(), before);
+});
+
+test('off Windows the spawn is what it always was: the same args, on the command line', async () => {
+  const invocation = hostileInvocation();
+  const calls = [];
+  const runClaude = createSpawnRunner({
+    claudeBin: 'claude',
+    platform: 'darwin',
+    resolveCommand: () => { throw new Error('not consulted off Windows'); },
+    spawnFn: (file, args, options) => {
+      calls.push({ file, args, options });
+      return spawn('sh', ['-c', 'cat >/dev/null; printf \'{"type":"result","is_error":false,"result":"ok"}\''], options);
+    },
+  });
+  await runClaude({ args: invocation.args, prompt: invocation.prompt });
+  assert.equal(calls[0].file, 'claude');
+  assert.equal(calls[0].args, invocation.args, 'the very same array');
+  assert.deepEqual(Object.keys(calls[0].options), ['cwd', 'env', 'stdio']);
+  assert.equal(argValue(calls[0].args, '--system-prompt'), invocation.systemPrompt);
+});
+
+test('stageSystemPrompt leaves arguments without a system prompt alone', async () => {
+  const args = ['-p', '--model', 'claude-opus-5-5'];
+  const staged = await stageSystemPrompt(args);
+  assert.equal(staged.args, args);
+  assert.equal(staged.file, null);
+  await staged.cleanup();
 });

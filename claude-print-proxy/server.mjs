@@ -12,6 +12,8 @@ import { spawn } from 'node:child_process';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
+import { commandInvocation, invocationOptions } from '../gateway/command.mjs';
+
 const PORT = Number(process.env.PORT || 11436);
 const HOST = process.env.HOST || '127.0.0.1';
 const SHARED_SECRET = process.env.CLAUDE_PROXY_SHARED_SECRET || '';
@@ -739,19 +741,72 @@ function childEnv() {
   return env;
 }
 
+// On Windows nothing taken from a request goes on a command line. The prompt is
+// stdin on every platform already; the system prompt, which carries the request's
+// system messages, is written to a private file there and handed over with
+// --system-prompt-file, the CLI's own equivalent of --system-prompt. A Windows
+// command line is also capped at 32,767 characters. What stays on it is fixed or
+// validated (model, effort, flags) plus --json-schema, which has no file form; it
+// reaches claude.exe or node directly, never cmd.exe.
+export async function stageSystemPrompt(args, { baseDir } = {}) {
+  const index = args.indexOf('--system-prompt');
+  if (index === -1) return { args, file: null, cleanup: async () => {} };
+  const parent = baseDir || await resolveWorkdir();
+  await fs.mkdir(parent, { recursive: true });
+  const dir = await fs.mkdtemp(path.join(parent, 'sys-'));
+  const file = path.join(dir, 'system-prompt.txt');
+  try {
+    await fs.writeFile(file, args[index + 1] ?? '', { mode: 0o600 });
+  } catch (error) {
+    await removeDir(dir);
+    throw error;
+  }
+  return {
+    args: [...args.slice(0, index), '--system-prompt-file', file, ...args.slice(index + 2)],
+    file,
+    cleanup: () => removeDir(dir),
+  };
+}
+
 export function createSpawnRunner({
   claudeBin = CLAUDE_BIN,
   timeoutMs = REQUEST_TIMEOUT_MS,
   spawnFn = spawn,
+  platform = process.platform,
+  resolveCommand = commandInvocation,
 } = {}) {
+  const windows = platform === 'win32';
   return async function runClaude({ args, prompt, cwd: cwdOverride, signal } = {}) {
     // An image request runs inside its own image directory, so `Read` stays
     // within the working directory and never triggers a permission prompt.
     const cwd = cwdOverride || await resolveWorkdir();
+    if (!windows) return spawnClaude({ args, prompt, cwd, signal });
+    let staged;
+    try {
+      staged = await stageSystemPrompt(args);
+    } catch (error) {
+      throw httpError(502, `Failed to write the system prompt for ${claudeBin}: ${error.message}`);
+    }
+    try {
+      return await spawnClaude({ args: staged.args, prompt, cwd, signal });
+    } finally {
+      await staged.cleanup();
+    }
+  };
+
+  function spawnClaude({ args, prompt, cwd, signal }) {
     return new Promise((resolve, reject) => {
       let child;
       try {
-        child = spawnFn(claudeBin, args, { cwd, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+        const env = childEnv();
+        const options = { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] };
+        if (windows) {
+          // The npm install is a .cmd shim spawn cannot start; run what it runs.
+          const call = resolveCommand(claudeBin, args, { env, platform, allowShell: false });
+          child = spawnFn(call.file, call.args, invocationOptions(call, options, platform));
+        } else {
+          child = spawnFn(claudeBin, args, options);
+        }
       } catch (error) {
         reject(httpError(502, `Failed to start ${claudeBin}: ${error.message}`));
         return;
@@ -828,7 +883,7 @@ export function createSpawnRunner({
       child.stdin.on('error', () => {});
       child.stdin.end(prompt ?? '');
     });
-  };
+  }
 }
 
 // ---------------------------------------------------------------------------

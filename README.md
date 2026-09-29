@@ -93,15 +93,29 @@ consumer terms say the same.
   (`CODEX_MODELS_CLIENT_VERSION`).
 - **`codex login status` answers on stderr**, with exit 0 when logged in and exit 1
   when not. Reading only stdout makes every login look missing.
+- **On Windows, `codex` and `claude` are npm `.cmd` shims.** `spawn("codex")` fails
+  there (spawn looks only for `.exe` and `.com`), and Node refuses to start a `.cmd`
+  without a shell. Every spawn of either CLI goes through `gateway/command.mjs`,
+  which finds the command on PATH with PATHEXT and runs what the shim runs: a
+  JavaScript entry under this Node, a native `.exe` directly. Only a batch file it
+  cannot read goes through `cmd.exe /d /s /c`, with every argument escaped. On
+  macOS and Linux it hands spawn the command exactly as before.
+- **On Windows no request text goes on a command line.** The Claude adapter's
+  prompt is stdin everywhere; on Windows the system prompt goes through a private
+  file (`--system-prompt-file`, removed after the run) instead of
+  `--system-prompt`. `--json-schema` has no file form and stays on the command
+  line, which reaches `claude.exe` directly and never `cmd.exe`: the adapter
+  refuses a `CLAUDE_BIN` that only `cmd.exe` could run.
 
 ### Verify a change
 
 ```sh
 npm test                                               # all of the below
 cd codex-openai-proxy && node --test server.test.mjs   # 23
-cd claude-print-proxy && node --test server.test.mjs   # 56
+cd claude-print-proxy && node --test server.test.mjs   # 60
 cd router            && node --test server.test.mjs    # 42
 cd ui                && node --test server.test.mjs    # 13
+node --test gateway/command.test.mjs                   # 7
 python3 -m unittest test_proxyctl.py                   # 5
 ```
 

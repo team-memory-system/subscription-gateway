@@ -10,11 +10,15 @@
 //
 // So nothing is ever copied out of ~/.codex or ~/.claude, and the Codex adapter's
 // refresh-token rotation has a single writer.
+//
+// On Windows both CLIs are npm .cmd shims, which spawn cannot start by name;
+// commandInvocation turns the name into the program the shim would run.
 import { execFile, spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { commandInvocation, invocationOptions } from "./command.mjs";
 import { gatewayPaths } from "./paths.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -123,7 +127,13 @@ function parseClaudeStatus(stdout) {
  * whether what it has is still usable. The credential file is reported too,
  * because the adapter needs that path and its absence explains a failed start.
  */
-export async function loginStatus(account, { paths = gatewayPaths(), env = process.env, runner = execFileAsync } = {}) {
+export async function loginStatus(account, {
+  paths = gatewayPaths(),
+  env = process.env,
+  runner = execFileAsync,
+  platform = process.platform,
+  resolve = commandInvocation,
+} = {}) {
   const name = account.backend;
   const entry = backend(name);
   const directory = accountDirectory(account, paths);
@@ -133,10 +143,11 @@ export async function loginStatus(account, { paths = gatewayPaths(), env = proce
   const identity = name === "codex" && credentialPresent ? await codexIdentity(directory) : {};
   let result;
   try {
-    result = await runner(backendBin(entry, env), entry.statusArgs, {
+    const call = resolve(backendBin(entry, env), entry.statusArgs, { env, platform });
+    result = await runner(call.file, call.args, invocationOptions(call, {
       env: authEnvironment(account, { paths, env }),
       timeout: 30_000,
-    });
+    }, platform));
   } catch (error) {
     // A missing CLI and a CLI that reports "not logged in" on a non-zero exit are
     // different situations, and only the first one the user has to fix elsewhere.
@@ -166,11 +177,18 @@ function shortError(error) {
  * finishes there, so this cannot report success; the caller polls `loginStatus`.
  * Output goes to a log file because a detached process with no stdout can wedge
  * a CLI that still tries to print.
+ *
+ * On Windows the login is not detached. A detached process there has no console,
+ * so a console program it starts (codex.js starts codex.exe) opens a window of its
+ * own; sharing the screen's hidden console avoids that. The price is that a login
+ * still waiting for the browser ends if the screen itself exits.
  */
 export async function startLogin(account, {
   paths = gatewayPaths(),
   env = process.env,
   spawnImpl = spawn,
+  platform = process.platform,
+  resolve = commandInvocation,
 } = {}) {
   const entry = backend(account.backend);
   await fsp.mkdir(accountDirectory(account, paths), { recursive: true });
@@ -178,11 +196,12 @@ export async function startLogin(account, {
   const logPath = paths.logFile(`login-${account.id}`);
   const handle = await fsp.open(logPath, "a");
   try {
-    const child = spawnImpl(backendBin(entry, env), entry.loginArgs, {
+    const call = resolve(backendBin(entry, env), entry.loginArgs, { env, platform });
+    const child = spawnImpl(call.file, call.args, invocationOptions(call, {
       env: authEnvironment(account, { paths, env }),
-      detached: true,
+      detached: platform !== "win32",
       stdio: ["ignore", handle.fd, handle.fd],
-    });
+    }, platform));
     child.unref();
     return { ok: true, started: true, accountId: account.id, backend: account.backend, pid: child.pid ?? null, logPath };
   } catch (error) {
@@ -192,13 +211,20 @@ export async function startLogin(account, {
   }
 }
 
-export async function logout(account, { paths = gatewayPaths(), env = process.env, runner = execFileAsync } = {}) {
+export async function logout(account, {
+  paths = gatewayPaths(),
+  env = process.env,
+  runner = execFileAsync,
+  platform = process.platform,
+  resolve = commandInvocation,
+} = {}) {
   const entry = backend(account.backend);
   try {
-    await runner(backendBin(entry, env), entry.logoutArgs, {
+    const call = resolve(backendBin(entry, env), entry.logoutArgs, { env, platform });
+    await runner(call.file, call.args, invocationOptions(call, {
       env: authEnvironment(account, { paths, env }),
       timeout: 60_000,
-    });
+    }, platform));
     return { ok: true, accountId: account.id, backend: account.backend };
   } catch (error) {
     return { ok: false, accountId: account.id, backend: account.backend, error: shortError(error) };
