@@ -9,7 +9,7 @@ import { authEnvironment, loginStatus } from "../gateway/auth.mjs";
 import { gatewayPaths } from "../gateway/paths.mjs";
 import { loadSecrets, SECRET_ENV } from "../gateway/secrets.mjs";
 import { adapterService, routerConfig, routerService, serviceEnvironment } from "../gateway/services.mjs";
-import { chatTest, connect, createHandler, requestAllowed, statusReport } from "./server.mjs";
+import { chatTest, connect, createHandler, createKeeper, requestAllowed, statusReport } from "./server.mjs";
 
 async function tempPaths(t) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "subscription-gateway-"));
@@ -303,6 +303,12 @@ test("the screen is served, an unknown path is a JSON 404, and a refused request
   await handler(fakeRequest({ url: "/api/nope" }), missing);
   assert.equal(missing.captured.status, 404);
 
+  // What launchd's installer and `proxyctl.py status ui` probe.
+  const health = fakeResponse();
+  await handler(fakeRequest({ url: "/health" }), health);
+  assert.equal(health.captured.status, 200);
+  assert.deepEqual(JSON.parse(health.captured.body), { status: "ok" });
+
   const refused = fakeResponse();
   await handler(fakeRequest({ method: "POST", url: "/api/login", host: "elsewhere.example:11450", contentType: "application/json", body: '{"backend":"codex"}' }), refused);
   assert.equal(refused.captured.status, 403);
@@ -416,4 +422,82 @@ test("the account and mode endpoints refuse what they do not know", async (t) =>
   assert.equal((await post("/api/login", { account: "codex-9" })).status, 404);
   assert.equal((await post("/api/accounts/remove", { account: "codex-9" })).status, 404);
   assert.equal((await post("/api/start", { service: "codex-9" })).status, 404);
+});
+
+test("the gateway keeps what it connected running, except what was stopped from the screen", async (t) => {
+  const { paths } = await tempPaths(t);
+  const codex = await addAccount("codex", { paths, env: {} });
+  const router = routerService({});
+  const up = new Set();
+  const fetchImpl = async (url) => {
+    if (up.has(Number(new URL(String(url)).port))) return new Response("{}", { status: 200 });
+    throw new Error("connection refused");
+  };
+  const started = [];
+  let failing = false;
+  const starter = async (entry) => {
+    if (failing) return { ok: false, error: "did not start" };
+    started.push(entry.key);
+    up.add(entry.port);
+    return { ok: true };
+  };
+  const stopper = async (entry) => { up.delete(entry.port); return { ok: true }; };
+  const lines = [];
+  let clock = 0;
+  const keeper = createKeeper({
+    paths,
+    env: {},
+    fetchImpl,
+    starter,
+    stopper,
+    now: () => clock,
+    log: line => lines.push(line),
+    runner: async () => ({ stdout: "", stderr: "Logged in using ChatGPT\n" }),
+  });
+
+  // Nothing is kept before a connect, so a tick on a fresh start does nothing.
+  await keeper.tick();
+  assert.deepEqual(started, []);
+
+  // At startup: whatever is logged in comes up, adapters before the router.
+  await keeper.resume();
+  assert.deepEqual(started, ["codex-1", "router"]);
+  assert.deepEqual(keeper.wanted(), ["codex-1", "router"]);
+  assert.equal(lines.at(-1).event, "resumed");
+
+  // Both die; the next tick brings both back, and says so.
+  up.clear();
+  started.length = 0;
+  await keeper.tick();
+  assert.deepEqual(started, ["codex-1", "router"]);
+  assert.deepEqual(lines.slice(-2).map(line => [line.event, line.service, line.ok]), [["restarted", "codex-1", true], ["restarted", "router", true]]);
+
+  // Stopped from the screen: it stays down until the next connect.
+  keeper.hold(codex.id);
+  up.delete(codex.port);
+  started.length = 0;
+  await keeper.tick();
+  assert.deepEqual(started, []);
+  await keeper.connect();
+  assert.ok(started.includes("codex-1"), "a connect keeps everything up again");
+
+  // A start that fails is retried later, not on every tick.
+  up.clear();
+  started.length = 0;
+  failing = true;
+  await keeper.tick();
+  failing = false;
+  await keeper.tick();
+  assert.deepEqual(started, [], "the same clock: still backing off");
+  clock += 10 * 60_000;
+  await keeper.tick();
+  assert.deepEqual(started, ["codex-1", "router"]);
+
+  // A removed account is not brought back.
+  keeper.forget(codex.id);
+  up.clear();
+  started.length = 0;
+  await keeper.tick();
+  assert.deepEqual(started, ["router"]);
+  assert.equal(up.has(router.port), true);
 });

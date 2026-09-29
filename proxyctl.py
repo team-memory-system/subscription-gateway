@@ -24,7 +24,26 @@ SERVICES = {
     'codex': (f'{PREFIX}.codex', 'codex-openai-proxy', 11435),
     'claude': (f'{PREFIX}.claude', 'claude-print-proxy', 11446),
     'router': (f'{PREFIX}.router', 'router', 11400),
+    # The gateway's screen. It starts its own router and one adapter per logged-in
+    # account, brings them up again when it starts, and restarts any that stop.
+    'ui': (f'{PREFIX}.ui', 'ui', 11450),
 }
+# `all` is the single-account setup. The screen is named on its own, and it and
+# `router` are never installed together: both run a router on 11400.
+ALL = ('codex', 'claude', 'router')
+EXCLUSIVE = {'ui': 'router', 'router': 'ui'}
+
+def port_variable(name):
+    return 'GATEWAY_UI_PORT' if name == 'ui' else 'PORT'
+
+def service_path():
+    """PATH for launchd: where node, codex and claude are, then the system's. Not
+    the installing shell's PATH, which can carry a terminal's per-session
+    directories that are gone by the next login."""
+    found = [shutil.which(tool) for tool in ('node', 'codex', 'claude')]
+    folders = [str(Path(tool).parent) for tool in found if tool]
+    folders += ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin']
+    return ':'.join(dict.fromkeys(folders))
 
 def legacy_label(name):
     """The label an earlier install of this service used, or '' when there is none."""
@@ -35,6 +54,10 @@ def launch(*args, check=True):
 
 def install(name):
     label, directory, port = SERVICES[name]
+    other = EXCLUSIVE.get(name)
+    if other and (AGENTS / (SERVICES[other][0] + '.plist')).exists():
+        raise SystemExit(f'{name}: {SERVICES[other][0]} is installed and also runs a router on 11400; '
+                         f'remove it first (proxyctl.py stop {other}, then delete its plist)')
     legacy = legacy_label(name)
     target = AGENTS / (label + '.plist')
     old = AGENTS / (legacy + '.plist') if legacy else None
@@ -49,8 +72,12 @@ def install(name):
         if not backup.exists():
             backup.write_bytes(existing.read_bytes()); backup.chmod(0o600)
     else:
-        data = {'RunAtLoad': True, 'KeepAlive': True, 'EnvironmentVariables': {
-            'HOST': '127.0.0.1', 'PORT': str(port), 'PATH': os.environ['PATH'], 'HOME': str(Path.home())}}
+        environment = {'PATH': service_path(), 'HOME': str(Path.home())}
+        # The screen binds loopback itself and hands each service its own HOST and
+        # PORT, so it gets neither: its children would inherit them.
+        if name == 'ui': environment['GATEWAY_UI_PORT'] = str(port)
+        else: environment.update(HOST='127.0.0.1', PORT=str(port))
+        data = {'RunAtLoad': True, 'KeepAlive': True, 'EnvironmentVariables': environment}
         if name == 'claude':
             data['EnvironmentVariables']['CLAUDE_BIN'] = shutil.which('claude') or 'claude'
     data.update(Label=label, ProgramArguments=[shutil.which('node') or '/opt/homebrew/bin/node', str(ROOT/directory/'server.mjs')],
@@ -69,7 +96,7 @@ def install(name):
     if result.returncode == 0:
         for _ in range(30):
             try:
-                with urllib.request.urlopen(f'http://127.0.0.1:{data["EnvironmentVariables"].get("PORT", port)}/health', timeout=1) as response:
+                with urllib.request.urlopen(f'http://127.0.0.1:{data["EnvironmentVariables"].get(port_variable(name), port)}/health', timeout=1) as response:
                     healthy = json.load(response).get('status') == 'ok'
                 if healthy:
                     break
@@ -92,7 +119,7 @@ def main():
     ap.add_argument('command', choices=['install', 'status', 'start', 'stop', 'restart', 'logs'])
     ap.add_argument('service', choices=['all', *SERVICES], nargs='?', default='all')
     args = ap.parse_args()
-    for name in SERVICES if args.service == 'all' else [args.service]:
+    for name in ALL if args.service == 'all' else [args.service]:
         label, _, port = SERVICES[name]
         target = f'gui/{os.getuid()}/{label}'
         if args.command == 'install': install(name)

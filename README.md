@@ -35,11 +35,17 @@ Two things can, and they are separate:
   supervisor detached that keeps all three alive. It needs `llmProxyRoot` in its host
   profile to point at this checkout. It registers nothing with the OS, so nothing
   restarts them after a reboot.
-- `ui/server.mjs` — the gateway's own screen (`npm run ui`). It keeps its own logins
-  and ports under the app directory, starts one adapter per account plus the router,
-  and also registers nothing with the OS.
+- `ui/server.mjs` — the gateway's own screen (`npm run ui`, http://127.0.0.1:11450).
+  It keeps its own logins and ports under the app directory and starts one adapter
+  per account plus the router (11400). When it starts, it connects whatever is
+  logged in; every 30 seconds it starts again any of those that stopped (one
+  stopped from the screen stays down until the next connect). On macOS,
+  `python3 proxyctl.py install ui` makes it a LaunchAgent (`subscription-gateway.ui`),
+  so all of it comes up at login.
 
-Do not let two of them manage the same service at once.
+Do not let two of them manage the same service at once. `proxyctl.py` refuses to
+install `ui` next to its own `router`, since both run a router on 11400, and
+`all` means the single-account three, not `ui`.
 
 ### Several accounts per subscription
 
@@ -95,8 +101,8 @@ npm test                                               # all of the below
 cd codex-openai-proxy && node --test server.test.mjs   # 23
 cd claude-print-proxy && node --test server.test.mjs   # 56
 cd router            && node --test server.test.mjs    # 42
-cd ui                && node --test server.test.mjs    # 12
-python3 -m unittest test_proxyctl.py                   # 3
+cd ui                && node --test server.test.mjs    # 13
+python3 -m unittest test_proxyctl.py                   # 5
 ```
 
 ### Licence
@@ -112,6 +118,7 @@ AGPL-3.0, retained from the extraction out of the Honcho fork. See `ORIGIN.txt`.
 | Codex | 11435 | pi-ai with Codex OAuth |
 | Claude | 11446 | Claude Code print mode |
 | Router | 11400 | Dispatch by request `model` to Codex, Claude and Ollama |
+| Screen | 11450 | Logins, accounts, and the router and adapters it keeps running (11460 and up) |
 
 ## Manage on macOS
 
@@ -129,6 +136,17 @@ python3 proxyctl.py logs codex
 python3 proxyctl.py stop claude
 python3 proxyctl.py start claude
 ```
+
+For several accounts per subscription, install the screen instead of `router`:
+
+```sh
+python3 proxyctl.py install ui      # LaunchAgent subscription-gateway.ui on 11450
+python3 proxyctl.py status ui
+python3 proxyctl.py logs ui         # the screen; each service logs under the app directory
+```
+
+Its plist gets `PATH` from where `node`, `codex` and `claude` are, plus the system
+folders, rather than the installing shell's `PATH`.
 
 Installation migrates existing LaunchAgents while retaining their environment
 and shared keys. Labels: `subscription-gateway.codex` and

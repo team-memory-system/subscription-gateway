@@ -64,4 +64,33 @@ class InstallTest(unittest.TestCase):
         booted_out = [call.args for call in launch.call_args_list if call.args[0] == 'bootout']
         self.assertEqual(booted_out, [('bootout', f'gui/{proxyctl.os.getuid()}/{self.label}')])
 
+    def test_the_screen_gets_its_own_port_variable_and_no_session_path(self):
+        # A terminal's per-session directory on the installing shell's PATH must not
+        # end up in a plist that runs at every login.
+        env = {**proxyctl.os.environ, 'PATH': '/private/tmp/session-shims:' + proxyctl.os.environ.get('PATH', '')}
+        ok = io.BytesIO(json.dumps({'status': 'ok'}).encode())
+        with patch.dict(proxyctl.os.environ, env, clear=True), patch.object(proxyctl, 'launch') as launch, \
+                patch.object(proxyctl.urllib.request, 'urlopen', return_value=ok) as urlopen, patch('sys.stdout', new_callable=io.StringIO):
+            launch.return_value.returncode = 0
+            proxyctl.install('ui')
+        data = plistlib.loads((proxyctl.AGENTS / (proxyctl.SERVICES['ui'][0] + '.plist')).read_bytes())
+        variables = data['EnvironmentVariables']
+        self.assertEqual(data['ProgramArguments'][1], str(proxyctl.ROOT/'ui/server.mjs'))
+        self.assertEqual(variables['GATEWAY_UI_PORT'], '11450')
+        # Its children would inherit these and bind the wrong port.
+        self.assertNotIn('PORT', variables)
+        self.assertNotIn('HOST', variables)
+        self.assertNotIn('/private/tmp/session-shims', variables['PATH'].split(':'))
+        self.assertIn('/usr/bin', variables['PATH'].split(':'))
+        self.assertEqual(urlopen.call_args.args[0], 'http://127.0.0.1:11450/health')
+
+    def test_the_screen_and_the_single_account_router_are_never_installed_together(self):
+        self.assertNotIn('ui', proxyctl.ALL)
+        router = proxyctl.AGENTS / (proxyctl.SERVICES['router'][0] + '.plist')
+        router.write_bytes(plistlib.dumps({'Label': proxyctl.SERVICES['router'][0]}))
+        with patch.object(proxyctl, 'launch') as launch:
+            with self.assertRaises(SystemExit): proxyctl.install('ui')
+            launch.assert_not_called()
+        self.assertFalse((proxyctl.AGENTS / (proxyctl.SERVICES['ui'][0] + '.plist')).exists())
+
 if __name__ == '__main__': unittest.main()

@@ -1,11 +1,12 @@
 // Starting, stopping and inspecting the local services: one adapter per account,
 // and the router in front of them.
 //
-// Nothing is registered with launchd, the Windows task scheduler or systemd. The
-// control server spawns each service detached and records its pid, so a CLI or a
-// UI that exits can still find and stop what it started — and so restarting the
-// UI never kills a running proxy. The cost is that a reboot leaves them down
-// until something starts them again.
+// None of these is registered with launchd, the Windows task scheduler or
+// systemd. The control server spawns each service detached and records its pid,
+// so a CLI or a UI that exits can still find and stop what it started — and so
+// restarting the UI never kills a running proxy. After a reboot they are down
+// until the control server starts; it then brings them up itself, and on macOS
+// `proxyctl.py install ui` has launchd start it at login.
 import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import path from "node:path";

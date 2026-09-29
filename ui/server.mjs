@@ -43,6 +43,9 @@ const STATIC_FILES = new Map([
   ["/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
 ]);
 const MAX_BODY_BYTES = 64 * 1024;
+// How often the gateway checks that what it connected is still running.
+export const KEEP_INTERVAL_MS = 30_000;
+const KEEP_MAX_BACKOFF_MS = 10 * 60_000;
 
 function json(res, status, body) {
   const text = JSON.stringify(body);
@@ -292,11 +295,101 @@ async function accountById(id, paths) {
   return findAccount(await readAccounts({ paths }), String(id || ""));
 }
 
-export function createHandler({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, port } = {}) {
+/**
+ * What the gateway keeps running without being asked. A connect decides the set:
+ * the router and the adapter of every account that was logged in. After that,
+ * `tick` starts again whatever of it has stopped, so a crashed adapter or router
+ * is back within KEEP_INTERVAL_MS; the router comes back with the config it
+ * already has. A service stopped from the screen stays down until the next
+ * connect, and one that fails to start is retried less and less often. At startup
+ * (at login, when launchd runs this server) `resume` connects whatever is logged
+ * in. Everything that starts or stops a service goes through `exclusive`, so a
+ * tick never races a connect that is restarting the router.
+ */
+export function createKeeper({
+  paths = gatewayPaths(),
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  runner,
+  starter = startService,
+  stopper = stopService,
+  now = Date.now,
+  log = line => console.log(JSON.stringify(line)),
+} = {}) {
+  let wanted = [];
+  const held = new Set();
+  const retry = new Map();
+  let queue = Promise.resolve();
+
+  function exclusive(task) {
+    const run = queue.then(task, task);
+    queue = run.catch(() => {});
+    return run;
+  }
+
+  async function connectNow() {
+    const result = await connect({ paths, env, fetchImpl, runner, starter, stopper });
+    held.clear();
+    retry.clear();
+    if (Array.isArray(result.connected)) {
+      const { accounts } = await readAccounts({ paths });
+      wanted = [
+        ...accounts.filter(account => result.connected.includes(account.id)).map(adapterService),
+        routerService(env),
+      ];
+    }
+    return result;
+  }
+
+  async function tick() {
+    if (!wanted.length) return;
+    const { secrets } = await loadSecrets({ paths });
+    for (const entry of wanted) {
+      if (held.has(entry.key)) continue;
+      const waiting = retry.get(entry.key);
+      if (waiting && now() < waiting.nextAt) continue;
+      if ((await serviceStatus(entry, { paths, fetchImpl })).running) {
+        retry.delete(entry.key);
+        continue;
+      }
+      const result = await starter(entry, { secrets, paths, env, fetchImpl });
+      if (result.ok) {
+        retry.delete(entry.key);
+      } else {
+        const failures = (waiting?.failures || 0) + 1;
+        retry.set(entry.key, { failures, nextAt: now() + Math.min(KEEP_INTERVAL_MS * 2 ** failures, KEEP_MAX_BACKOFF_MS) });
+      }
+      log({ event: "restarted", at: new Date(now()).toISOString(), service: entry.key, ok: result.ok, ...(result.ok ? {} : { error: result.error }) });
+    }
+  }
+
+  return {
+    exclusive,
+    connect: () => exclusive(connectNow),
+    resume: () => exclusive(async () => {
+      const result = await connectNow();
+      log({ event: "resumed", at: new Date(now()).toISOString(), ok: result.ok, connected: result.connected || [], ...(result.error ? { error: result.error } : {}) });
+      return result;
+    }),
+    tick: () => exclusive(tick),
+    /** Stopped from the screen: not restarted until the next connect. */
+    hold(key) { held.add(key); },
+    /** Started from the screen: kept up again. */
+    release(key) { held.delete(key); retry.delete(key); },
+    /** An account that is gone: nothing of it is kept up any more. */
+    forget(key) { wanted = wanted.filter(entry => entry.key !== key); held.delete(key); retry.delete(key); },
+    wanted: () => wanted.map(entry => entry.key),
+  };
+}
+
+export function createHandler({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, port, keeper = createKeeper({ paths, env, fetchImpl }) } = {}) {
   return async function handler(req, res) {
     const allowed = requestAllowed(req, { port });
     if (!allowed.ok) return json(res, allowed.status, { error: allowed.error });
     const url = new URL(req.url, `http://127.0.0.1:${port}`);
+
+    // For launchd and `proxyctl.py status ui`: the screen's own server is up.
+    if (req.method === "GET" && url.pathname === "/health") return json(res, 200, { status: "ok" });
 
     if (req.method === "GET" && STATIC_FILES.has(url.pathname)) {
       const entry = STATIC_FILES.get(url.pathname);
@@ -336,10 +429,13 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
         const account = await accountById(body.account, paths);
         if (!account) return json(res, 404, { ok: false, error: "그런 계정이 없습니다" });
         // What was serving it goes first, then its login, then its directory.
-        const stopped = await stopService(adapterService(account), { paths, fetchImpl });
-        const loggedOut = await logout(account, { paths, env });
-        await removeAccount(account.id, { paths });
-        return json(res, 200, { ok: true, removed: account.id, stopped: stopped.ok, loggedOut: loggedOut.ok });
+        return await keeper.exclusive(async () => {
+          keeper.forget(account.id);
+          const stopped = await stopService(adapterService(account), { paths, fetchImpl });
+          const loggedOut = await logout(account, { paths, env });
+          await removeAccount(account.id, { paths });
+          return json(res, 200, { ok: true, removed: account.id, stopped: stopped.ok, loggedOut: loggedOut.ok });
+        });
       }
       if (req.method === "POST" && url.pathname === "/api/accounts/move") {
         const moved = await moveAccount(String(body.account || ""), String(body.direction || ""), { paths });
@@ -365,7 +461,7 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
         return json(res, result.ok ? 200 : 400, result);
       }
       if (req.method === "POST" && url.pathname === "/api/connect") {
-        const result = await connect({ paths, env, fetchImpl });
+        const result = await keeper.connect();
         return json(res, result.ok ? 200 : 400, result);
       }
       if (req.method === "POST" && url.pathname === "/api/router-config") {
@@ -375,20 +471,26 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
       if (req.method === "POST" && url.pathname === "/api/start") {
         const entry = await serviceByKey(String(body.service || ""), { paths, env });
         if (!entry) return json(res, 404, { ok: false, error: "그런 서비스가 없습니다" });
-        const { secrets } = await loadSecrets({ paths });
-        if (entry.kind === "router") {
-          const { mode, accounts } = await loggedInAccounts({ paths, env });
-          const applied = await applyRouterConfig({ accounts, mode, paths, env });
-          if (!applied.ok) return json(res, 400, applied);
-        }
-        const result = await startService(entry, { secrets, paths, env, fetchImpl });
-        return json(res, result.ok ? 200 : 400, result);
+        return await keeper.exclusive(async () => {
+          keeper.release(entry.key);
+          const { secrets } = await loadSecrets({ paths });
+          if (entry.kind === "router") {
+            const { mode, accounts } = await loggedInAccounts({ paths, env });
+            const applied = await applyRouterConfig({ accounts, mode, paths, env });
+            if (!applied.ok) return json(res, 400, applied);
+          }
+          const result = await startService(entry, { secrets, paths, env, fetchImpl });
+          return json(res, result.ok ? 200 : 400, result);
+        });
       }
       if (req.method === "POST" && url.pathname === "/api/stop") {
         const entry = await serviceByKey(String(body.service || ""), { paths, env });
         if (!entry) return json(res, 404, { ok: false, error: "그런 서비스가 없습니다" });
-        const result = await stopService(entry, { paths, fetchImpl });
-        return json(res, result.ok ? 200 : 400, result);
+        return await keeper.exclusive(async () => {
+          keeper.hold(entry.key);
+          const result = await stopService(entry, { paths, fetchImpl });
+          return json(res, result.ok ? 200 : 400, result);
+        });
       }
       if (req.method === "POST" && url.pathname === "/api/chat") {
         const result = await chatTest({ model: body.model, prompt: body.prompt, paths, env, fetchImpl });
@@ -401,8 +503,8 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
   };
 }
 
-export function createServer({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, port = DEFAULT_PORT } = {}) {
-  return http.createServer(createHandler({ paths, env, fetchImpl, port }));
+export function createServer({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, port = DEFAULT_PORT, keeper } = {}) {
+  return http.createServer(createHandler({ paths, env, fetchImpl, port, ...(keeper ? { keeper } : {}) }));
 }
 
 export function uiPort(env = process.env) {
@@ -413,7 +515,13 @@ export function uiPort(env = process.env) {
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   const port = uiPort();
-  createServer({ port }).listen(port, "127.0.0.1", () => {
+  const keeper = createKeeper();
+  const report = error => console.log(JSON.stringify({ event: "keep_failed", error: String(error?.message || error).slice(0, 300) }));
+  // Only once the port is ours: a second copy that fails to bind must not start
+  // or restart anything on its way out.
+  createServer({ port, keeper }).listen(port, "127.0.0.1", () => {
     console.log(JSON.stringify({ status: "listening", url: `http://127.0.0.1:${port}` }));
+    keeper.resume().catch(report);
+    setInterval(() => keeper.tick().catch(report), KEEP_INTERVAL_MS);
   });
 }
