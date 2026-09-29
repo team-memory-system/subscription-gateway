@@ -3,8 +3,9 @@
 //
 //   node gateway/cli.mjs install       npm dependencies, state and keys, per-user
 //                                      autostart of the screen, started now
-//   node gateway/cli.mjs uninstall     the autostart removed and the screen stopped;
-//                                      logins and state stay
+//   node gateway/cli.mjs uninstall     the autostart removed, the screen stopped, and
+//                                      the router and adapters it started stopped;
+//                                      logins, accounts and keys stay
 //   node gateway/cli.mjs status        what answers, who is logged in, which models
 //   node gateway/cli.mjs connect-info  the router's address, its client key, its models
 //   node gateway/cli.mjs open          the screen's address, opened in a browser
@@ -28,6 +29,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { statusReport, uiPort } from "../ui/server.mjs";
+import { readAccounts } from "./accounts.mjs";
 import {
   askSupervisor,
   autostartKind,
@@ -39,7 +41,7 @@ import {
 import { commandInvocation, invocationOptions } from "./command.mjs";
 import { gatewayPaths, sourceRoot, userHome } from "./paths.mjs";
 import { loadSecrets, readSecrets } from "./secrets.mjs";
-import { dependencyFolders, probeHealth, routerService, serviceUrl } from "./services.mjs";
+import { adapterService, dependencyFolders, probeHealth, routerService, serviceUrl, stopService } from "./services.mjs";
 
 export const COMMANDS = Object.freeze(["install", "uninstall", "status", "connect-info", "open"]);
 const USAGE = `사용법: node gateway/cli.mjs <${COMMANDS.join("|")}>`;
@@ -84,6 +86,7 @@ export function cliContext({
   files,
   runner,
   openBrowser,
+  stopper = stopService,
 } = {}) {
   const paths = gatewayPaths(env, platform);
   const port = uiPort(env);
@@ -107,6 +110,7 @@ export function cliContext({
     which,
     files,
     runner,
+    stopper,
     openBrowser: openBrowser || (url => openInBrowser(url, { platform, env, spawnImpl })),
   };
 }
@@ -158,9 +162,48 @@ async function install(ctx) {
   return { ok: true, autostart: kind, uiUrl: ctx.uiUrl, routerUrl: ctx.routerUrl };
 }
 
+/** The router as the screen configured it: its port is in router-config.json. */
+async function configuredRouter(ctx) {
+  const router = routerService(ctx.env);
+  try {
+    const port = Number(JSON.parse(await fsp.readFile(ctx.paths.routerConfigFile, "utf8"))?.listen?.port);
+    if (Number.isInteger(port) && port > 0 && port < 65_536) return { ...router, port };
+  } catch {
+    // Never connected: nothing wrote a config yet.
+  }
+  return router;
+}
+
+/**
+ * Stops what the screen started, each by its pid file: the router first, then
+ * every account's adapter. Returns the names of the services that were stopped.
+ * A service something else started, or a pid that no longer answers on its port,
+ * is left alone (see stopService).
+ */
+async function stopGatewayServices(ctx) {
+  const { accounts } = await readAccounts({ paths: ctx.paths });
+  const services = [await configuredRouter(ctx), ...accounts.map(adapterService)];
+  const stopped = [];
+  const failed = [];
+  for (const entry of services) {
+    const result = await ctx.stopper(entry, { paths: ctx.paths, fetchImpl: ctx.fetchImpl });
+    if (result.stopped && result.ok) stopped.push(entry.key);
+    else if (result.stopped || result.error) failed.push(result.error ? `${entry.key} (${result.error})` : entry.key);
+  }
+  if (failed.length) throw new Error(`자동 시작은 지웠지만 멈추지 못한 서비스가 있습니다: ${failed.join(", ")}`);
+  return stopped;
+}
+
+/**
+ * Leaves nothing of this checkout running, so the checkout can be replaced: on
+ * Windows a process started from a folder keeps it from being renamed. The screen
+ * goes first, since its keeper would start again whatever is stopped under it.
+ * Logins, accounts.json, the keys and the router config stay, so the next
+ * install's screen connects the same accounts again.
+ */
 async function uninstall(ctx) {
   await uninstallAutostart(ctx);
-  return { ok: true };
+  return { ok: true, stopped: await stopGatewayServices(ctx) };
 }
 
 // ------------------------------------------------------------------- status

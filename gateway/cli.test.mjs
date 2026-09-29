@@ -3,7 +3,7 @@
 // file lives in a temporary directory, and the real processes started (the CLI
 // itself, the supervisor's stand-in screen) use their own directory and ports.
 import assert from "node:assert/strict";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import net from "node:net";
@@ -15,7 +15,10 @@ import { promisify } from "node:util";
 
 import { launchAgent, renderPlist, RUN_KEY, RUN_VALUE, SYSTEMD_UNIT } from "./autostart.mjs";
 import { openInBrowser, runCli } from "./cli.mjs";
+import { createKeeper } from "../ui/server.mjs";
 import { gatewayPaths, sourceRoot } from "./paths.mjs";
+import { loadSecrets } from "./secrets.mjs";
+import { stopService } from "./services.mjs";
 import { askSupervisor, restartDelay, superviseScreen, supervisorEndpoint } from "./supervise.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -251,12 +254,147 @@ test("uninstall on macOS boots the agent out and removes it, and says ok when th
     if (args[0] === "bootout") loaded = false;
     return { code: 0 };
   });
-  const first = await runCli(["uninstall"], { env, platform: "darwin", root, run, uid: 501 });
-  assert.deepEqual(first, { code: 0, result: { ok: true } });
+  const first = await runCli(["uninstall"], { env, platform: "darwin", root, run, uid: 501, fetchImpl: deadScreen });
+  assert.deepEqual(first, { code: 0, result: { ok: true, stopped: [] } });
   assert.deepEqual(run.calls.map(call => call.args), [["print", "gui/501/subscription-gateway.ui"], ["bootout", "gui/501/subscription-gateway.ui"]]);
   await assert.rejects(fsp.access(plistPath));
   await fsp.access(path.join(env.GATEWAY_HOME, "accounts.json"));
-  assert.deepEqual(await runCli(["uninstall"], { env, platform: "darwin", root, run, uid: 501 }), { code: 0, result: { ok: true } });
+  assert.deepEqual(await runCli(["uninstall"], { env, platform: "darwin", root, run, uid: 501, fetchImpl: deadScreen }), { code: 0, result: { ok: true, stopped: [] } });
+});
+
+// --------------------------------------------- uninstall stops what runs
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A stand-in for an adapter or the router: a real process answering /health. */
+async function standIn(t, port) {
+  const child = spawn(process.execPath, ["-e", `require("node:http").createServer((q, s) => s.end('{"status":"ok"}')).listen(${port}, "127.0.0.1")`], { stdio: "ignore" });
+  t.after(() => { if (alive(child.pid)) child.kill("SIGKILL"); });
+  assert.ok(await until(() => fetch(`http://127.0.0.1:${port}/health`).then(response => response.ok, () => false)), `stand-in on ${port}`);
+  return child;
+}
+
+async function recordPid(paths, key, pid) {
+  await fsp.mkdir(paths.runtimeDir, { recursive: true });
+  await fsp.writeFile(paths.pidFile(key), JSON.stringify({ pid, startedAt: new Date().toISOString() }));
+}
+
+async function distinctPorts(count) {
+  const ports = new Set();
+  while (ports.size < count) ports.add(await freePort());
+  return [...ports];
+}
+
+/** What a connected gateway leaves in its app directory. Ports are free ones, never 114xx. */
+async function connectedState(dir, accounts, routerPort) {
+  const paths = gatewayPaths({ GATEWAY_HOME: path.join(dir, "app") }, process.platform);
+  await fsp.mkdir(paths.appHome, { recursive: true });
+  await fsp.writeFile(paths.accountsFile, JSON.stringify({ format: 1, mode: "drain", accounts }));
+  await fsp.writeFile(paths.routerConfigFile, JSON.stringify({ listen: { host: "127.0.0.1", port: routerPort }, backends: [] }));
+  await loadSecrets({ paths });
+  for (const account of accounts) {
+    await fsp.mkdir(paths.authDir(account.backend, account.id), { recursive: true });
+    await fsp.writeFile(path.join(paths.authDir(account.backend, account.id), "credentials.json"), '{"a":"login"}');
+  }
+  const kept = async () => Promise.all([paths.accountsFile, paths.secretsFile, paths.routerConfigFile,
+    ...accounts.map(account => path.join(paths.authDir(account.backend, account.id), "credentials.json"))]
+    .map(file => fsp.readFile(file, "utf8")));
+  return { paths, kept };
+}
+
+const quickStop = (entry, options) => stopService(entry, { ...options, confirmDelayMs: 20 });
+
+test("uninstall also stops the router and each adapter the screen started, and nothing else", async (t) => {
+  const dir = await tempDir(t);
+  const [routerPort, codexPort, claudePort, silentPort, otherRouterPort] = await distinctPorts(5);
+  const accounts = [
+    { id: "codex-1", backend: "codex", port: codexPort },
+    { id: "claude-1", backend: "claude", port: claudePort },
+    { id: "codex-2", backend: "codex", port: silentPort },
+  ];
+  const { paths, kept } = await connectedState(dir, accounts, routerPort);
+  const before = await kept();
+  const router = await standIn(t, routerPort);
+  await recordPid(paths, "router", router.pid);
+  const codex = await standIn(t, codexPort);
+  await recordPid(paths, "codex-1", codex.pid);
+  // Something else answers on claude-1's port, with no pid file of ours.
+  const foreign = await standIn(t, claudePort);
+  // codex-2's pid file names a live process that does not answer on codex-2's
+  // port: after a restart or a crash that number can be anyone's.
+  const bystander = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  t.after(() => { if (alive(bystander.pid)) bystander.kill("SIGKILL"); });
+  await recordPid(paths, "codex-2", bystander.pid);
+
+  const run = recorder(async (file, args) => (args[0] === "print" ? { code: 113 } : { code: 0 }));
+  // The router's port comes from the config the screen wrote, not from this environment.
+  const env = { GATEWAY_HOME: paths.appHome, GATEWAY_USER_HOME: path.join(dir, "home"), GATEWAY_ROUTER_PORT: String(otherRouterPort) };
+  const { code, result } = await runCli(["uninstall"], { env, platform: "darwin", root: dir, run, uid: 501, stopper: quickStop });
+  assert.equal(code, 0, JSON.stringify(result));
+  assert.deepEqual(result, { ok: true, stopped: ["router", "codex-1"] });
+  assert.ok(await until(() => !alive(router.pid) && !alive(codex.pid)), "stopped means gone");
+  assert.equal(alive(foreign.pid), true, "what this gateway did not start is left alone");
+  assert.equal(alive(bystander.pid), true, "a pid that does not answer as ours is not signalled");
+  for (const key of ["router", "codex-1", "codex-2"]) await assert.rejects(fsp.access(paths.pidFile(key)), key);
+  assert.deepEqual(await kept(), before, "logins, accounts, keys and the router config stay");
+});
+
+test("after uninstall, a new copy's install and its screen connect the same accounts again", async (t) => {
+  const dir = await tempDir(t);
+  const [routerPort, codexPort, claudePort] = await distinctPorts(3);
+  const accounts = [
+    { id: "codex-1", backend: "codex", port: codexPort },
+    { id: "claude-1", backend: "claude", port: claudePort },
+  ];
+  const { paths, kept } = await connectedState(dir, accounts, routerPort);
+  const before = await kept();
+  // The old copy's processes, as its keeper left them.
+  for (const [key, port] of [["router", routerPort], ["codex-1", codexPort], ["claude-1", claudePort]]) {
+    await recordPid(paths, key, (await standIn(t, port)).pid);
+  }
+  const env = { GATEWAY_HOME: paths.appHome, GATEWAY_USER_HOME: path.join(dir, "home"), GATEWAY_ROUTER_PORT: String(routerPort) };
+  let loaded = true;
+  const run = recorder(async (file, args) => {
+    if (args[0] === "print") return { code: loaded ? 0 : 113 };
+    if (args[0] === "bootout") loaded = false;
+    if (args[0] === "bootstrap") loaded = true;
+    return { code: 0 };
+  });
+  const old = await sourceTree(path.join(dir, "old"), { dependencies: true });
+  const uninstalled = await runCli(["uninstall"], { env, platform: "darwin", root: old, run, uid: 501, stopper: quickStop });
+  assert.deepEqual(uninstalled.result, { ok: true, stopped: ["router", "codex-1", "claude-1"] });
+
+  // The installer swaps the source folder here. The app directory is not part of it.
+  const fresh = await sourceTree(path.join(dir, "new"), { dependencies: true });
+  const installed = await runCli(["install"], { env, platform: "darwin", root: fresh, run, uid: 501, fetchImpl: healthyScreen(), ...fakeClock() });
+  assert.equal(installed.result.ok, true, JSON.stringify(installed.result));
+  assert.deepEqual(await kept(), before, "install kept every login and key");
+
+  // The first thing that install's screen does: resume, which connects whatever is logged in.
+  const started = [];
+  const keeper = createKeeper({
+    paths,
+    env,
+    fetchImpl: deadScreen,
+    runner: async (bin, args) => (args[0] === "login"
+      ? { stdout: "", stderr: "Logged in using ChatGPT\n" }
+      : { stdout: JSON.stringify({ loggedIn: true, authMethod: "claude.ai" }), stderr: "" }),
+    starter: async entry => { started.push(entry.key); return { ok: true }; },
+    stopper: async () => ({ ok: true }),
+    log: () => {},
+  });
+  const resumed = await keeper.resume();
+  assert.equal(resumed.ok, true);
+  assert.deepEqual(resumed.connected, ["codex-1", "claude-1"]);
+  assert.deepEqual(started, ["codex-1", "claude-1", "router"]);
+  assert.deepEqual(keeper.wanted(), ["codex-1", "claude-1", "router"], "kept up from then on");
 });
 
 // ---------------------------------------------------------------- Windows
@@ -353,8 +491,8 @@ test("uninstall on Windows deletes the Run value, stops the supervisor and remov
     return supervisor;
   };
   const run = recorder(async (file, args) => (args[0] === "query" ? { code: 1 } : { code: 0 }));
-  const { code, result } = await runCli(["uninstall"], { env, platform: "win32", root, run, ask, files, execPath, ...fakeClock() });
-  assert.deepEqual({ code, result }, { code: 0, result: { ok: true } });
+  const { code, result } = await runCli(["uninstall"], { env, platform: "win32", root, run, ask, files, execPath, fetchImpl: deadScreen, ...fakeClock() });
+  assert.deepEqual({ code, result }, { code: 0, result: { ok: true, stopped: [] } });
   assert.deepEqual(run.calls.map(call => call.args.slice(0, 3)), [
     ["delete", RUN_KEY, "/v"],
     ["delete", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run", "/v"],
@@ -399,7 +537,7 @@ test("install on Linux: a systemd user unit that restarts the screen, or a clear
   assert.equal(run.calls.at(-1).args.slice(1).join(" "), `start ${SYSTEMD_UNIT}`, "unchanged: started if stopped, not restarted");
 
   run.calls.length = 0;
-  assert.deepEqual(await runCli(["uninstall"], { env, platform: "linux", root, run }), { code: 0, result: { ok: true } });
+  assert.deepEqual(await runCli(["uninstall"], { env, platform: "linux", root, run, fetchImpl: deadScreen }), { code: 0, result: { ok: true, stopped: [] } });
   assert.deepEqual(run.calls.map(call => call.args.slice(1).join(" ")), [`disable --now ${SYSTEMD_UNIT}`, "daemon-reload"]);
   await assert.rejects(fsp.access(path.join(env.XDG_CONFIG_HOME, "systemd", "user", SYSTEMD_UNIT)));
 });

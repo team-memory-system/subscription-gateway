@@ -56,6 +56,12 @@ install `ui` next to its own `router`, since both run a router on 11400, and so 
 object. It needs only Node. `connect-info` prints the router's client key, and is
 the only command that prints a secret.
 
+To replace a checkout, run the old copy's `uninstall`, swap the folders, then run
+the new copy's `install`. `uninstall` leaves nothing of the old folder running
+(on Windows a running process keeps its folder from being renamed), and the new
+screen connects every account that is logged in, from the logins and
+`accounts.json` that `uninstall` kept.
+
 ### Several accounts per subscription
 
 The screen holds any number of Codex and Claude logins. Each account is written to
@@ -127,7 +133,7 @@ cd claude-print-proxy && node --test server.test.mjs   # 60
 cd router            && node --test server.test.mjs    # 42
 cd ui                && node --test server.test.mjs    # 13
 node --test gateway/command.test.mjs                   # 7
-node --test gateway/cli.test.mjs                       # 16 (3 skip on a Windows host)
+node --test gateway/cli.test.mjs                       # 18 (3 skip on a Windows host)
 python3 -m unittest test_proxyctl.py                   # 5
 ```
 
@@ -168,7 +174,7 @@ Diagnostics, if any, go to stderr.
 | Command | Output |
 |---|---|
 | `install` | `{"ok":true,"autostart":"launchd","uiUrl":"http://127.0.0.1:11450","routerUrl":"http://127.0.0.1:11400/v1"}` — `autostart` is `launchd`, `windows-run` or `systemd` |
-| `uninstall` | `{"ok":true}` |
+| `uninstall` | `{"ok":true,"stopped":["router","codex-1","claude-1"]}` — the services it stopped |
 | `status` | `{"ok":true,"ui":{"url":"http://127.0.0.1:11450","ok":true},"router":{"url":"http://127.0.0.1:11400/v1","ok":true},"autostart":{"kind":"launchd","installed":true},"accounts":[{"id":"codex-1","backend":"codex","loggedIn":true,"serving":true}],"models":["gpt-5.5"]}` |
 | `connect-info` | `{"ok":true,"ready":true,"baseUrl":"http://127.0.0.1:11400/v1","apiKey":"<router key>","models":["gpt-5.5"]}`, plus `"reason":"..."` when `ready` is false |
 | `open` | `{"ok":true,"url":"http://127.0.0.1:11450"}` |
@@ -184,9 +190,15 @@ Diagnostics, if any, go to stderr.
   screen that does not answer in time leaves the autostart registered, and the
   error names the log to read.
 - **`uninstall`** removes the autostart and stops the screen it runs (on Windows,
-  with its supervisor). Logins, accounts and keys stay. The router and the
-  adapters the screen started are detached and keep running until they are
-  stopped from the screen or the computer restarts.
+  with its supervisor), then the router and every account's adapter the screen
+  started, in that order: the screen's keeper would start again what is stopped
+  under it. `stopped` names them. Logins, `accounts.json`, the keys and the router
+  config stay, so the next `install` connects the same accounts again. Each
+  service is stopped by its pid file, and only if it answers on its port: after a
+  restart the number in a pid file can belong to another program, so a pid whose
+  service does not answer is not signalled (its pid file is dropped), and a
+  service something else started is left alone. A service that will not stop
+  makes `uninstall` fail with its name.
 - **`status`** is the screen's own `/api/status` when the screen answers, and
   otherwise the same report made in the CLI, which creates no keys. `router.ok`
   means the router answers `/health`; `serving` means the router routes to that
@@ -242,8 +254,9 @@ so the autostart is three parts:
   `install` then times out and `ui-supervisor.log` is never written.
 - The screen, the supervisor, the router and the adapters run with folders of
   the checkout as their working directories, which on Windows keeps the checkout
-  from being renamed or deleted while they run. `uninstall` stops the screen and
-  the supervisor; stop the rest from the screen, or restart, before replacing it.
+  from being renamed or deleted while they run. `uninstall` stops all of them. A
+  screen started by hand (`npm run ui`) is not the autostart's and keeps running,
+  and its keeper starts the rest again.
 - Logging in from the screen shares the screen's hidden console rather than
   running detached, so no console window opens; a login still waiting for the
   browser ends if the screen exits.

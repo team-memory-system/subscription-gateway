@@ -255,7 +255,12 @@ export async function startService(entry, {
   };
 }
 
-export async function stopService(entry, { paths = gatewayPaths(), fetchImpl = globalThis.fetch } = {}) {
+export async function stopService(entry, {
+  paths = gatewayPaths(),
+  fetchImpl = globalThis.fetch,
+  confirmAttempts = 5,
+  confirmDelayMs = 1_000,
+} = {}) {
   const pid = await pidState(paths.pidFile(entry.key));
   if (!pid.running) {
     await fsp.rm(paths.pidFile(entry.key), { force: true });
@@ -263,6 +268,22 @@ export async function stopService(entry, { paths = gatewayPaths(), fetchImpl = g
     // Something this gateway did not start may still hold the port. Say that
     // instead of reporting a stop that did not happen.
     return { ok: !status.running, stopped: false, unmanaged: status.running, status };
+  }
+  // A pid file holds only a number, and after a restart or a crash that number
+  // can belong to another program by now: the router's pid file outlives a
+  // reboot, and connect() stops the router first. A service of this gateway
+  // answers on its port, so only then is the pid signalled. One that was just
+  // spawned gets a few seconds to start answering; one that never does is
+  // forgotten, not killed.
+  let answering = false;
+  for (let attempt = 0; attempt < confirmAttempts && !answering; attempt += 1) {
+    if (attempt) await new Promise(resolve => setTimeout(resolve, confirmDelayMs));
+    answering = (await probeHealth(serviceUrl(entry), { fetchImpl })).ok;
+  }
+  if (!answering) {
+    await fsp.rm(paths.pidFile(entry.key), { force: true });
+    const status = await serviceStatus(entry, { paths, fetchImpl });
+    return { ok: !status.running, stopped: false, unverified: true, status };
   }
   try {
     process.kill(pid.pid, "SIGTERM");
