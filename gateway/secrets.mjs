@@ -40,20 +40,24 @@ async function writePrivate(target, text) {
   await fsp.rename(temporary, target);
 }
 
+async function readStored(paths) {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(paths.secretsFile, "utf8"));
+    if (parsed && typeof parsed === "object" && parsed.secrets && typeof parsed.secrets === "object") {
+      return parsed.secrets;
+    }
+  } catch {
+    // no file yet, or not ours to read
+  }
+  return {};
+}
+
 /**
  * Reads the keys, creating any that are missing. Callers get the values; nothing
  * here logs or returns them anywhere a response could pick them up.
  */
 export async function loadSecrets({ paths = gatewayPaths(), services = Object.keys(SECRET_ENV) } = {}) {
-  let stored = {};
-  try {
-    const parsed = JSON.parse(await fsp.readFile(paths.secretsFile, "utf8"));
-    if (parsed && typeof parsed === "object" && parsed.secrets && typeof parsed.secrets === "object") {
-      stored = parsed.secrets;
-    }
-  } catch {
-    stored = {};
-  }
+  const stored = await readStored(paths);
   const secrets = {};
   const created = [];
   for (const service of services) {
@@ -72,6 +76,17 @@ export async function loadSecrets({ paths = gatewayPaths(), services = Object.ke
     await writePrivate(paths.secretsFile, `${JSON.stringify({ format: FORMAT, secrets: merged }, null, 2)}\n`);
   }
   return { secrets, created };
+}
+
+/** The keys that exist, creating none: for a caller that only looks, such as `cli.mjs status`. */
+export async function readSecrets({ paths = gatewayPaths(), services = Object.keys(SECRET_ENV) } = {}) {
+  const stored = await readStored(paths);
+  const secrets = {};
+  for (const service of services) {
+    const existing = String(stored[service] || "").trim();
+    if (existing) secrets[service] = existing;
+  }
+  return { secrets, created: [] };
 }
 
 /** The environment a service needs to recognize its own callers. */

@@ -112,20 +112,31 @@ function routingByAccount(routerStatus) {
     .map(entry => [entry.name, entry.routing]));
 }
 
-/** Everything the screen draws. No secret is part of this. */
-export async function statusReport({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, runner } = {}) {
+/**
+ * Everything the screen draws. No secret is part of this. `secretsLoader` is
+ * readSecrets for a caller that must not create the keys just by looking.
+ */
+export async function statusReport({
+  paths = gatewayPaths(),
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  runner,
+  secretsLoader = loadSecrets,
+} = {}) {
   const state = await readAccounts({ paths });
   const ask = runner ? { paths, env, runner } : { paths, env };
   const router = routerService(env);
   const [{ secrets }, logins, adapters, routerStatus] = await Promise.all([
-    loadSecrets({ paths }),
+    secretsLoader({ paths }),
     Promise.all(state.accounts.map(account => loginStatus(account, ask))),
     Promise.all(state.accounts.map(account => serviceStatus(adapterService(account), { paths, fetchImpl }))),
     serviceStatus(router, { paths, fetchImpl }),
   ]);
   let models = { ok: false, reason: "라우터가 실행 중이 아닙니다" };
-  if (routerStatus.running) {
+  if (routerStatus.running && secrets.router) {
     models = await routerModels({ secrets, env, fetchImpl });
+  } else if (routerStatus.running) {
+    models = { ok: false, reason: "라우터 키가 아직 없습니다" };
   }
   const routing = routingByAccount(routerStatus);
   const accounts = state.accounts.map((account, index) => ({

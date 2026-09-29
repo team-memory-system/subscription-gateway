@@ -26,7 +26,7 @@ This keeps coming up, so: they are on the host because they reach host-only thin
 
 ### Who starts them
 
-Two things can, and they are separate:
+Three things can, and they are separate:
 
 - `proxyctl.py` — macOS LaunchAgents, `subscription-gateway.*`. This is what runs
   on the owner's machine today. It preserves an existing plist's OAuth source and
@@ -39,13 +39,22 @@ Two things can, and they are separate:
   It keeps its own logins and ports under the app directory and starts one adapter
   per account plus the router (11400). When it starts, it connects whatever is
   logged in; every 30 seconds it starts again any of those that stopped (one
-  stopped from the screen stays down until the next connect). On macOS,
-  `python3 proxyctl.py install ui` makes it a LaunchAgent (`subscription-gateway.ui`),
-  so all of it comes up at login.
+  stopped from the screen stays down until the next connect).
+  `node gateway/cli.mjs install` registers it to start at login on macOS, Windows
+  and Linux, so all of it comes up by itself; on macOS that is the same LaunchAgent
+  `python3 proxyctl.py install ui` writes (`subscription-gateway.ui`). See
+  [Command line](#command-line).
 
 Do not let two of them manage the same service at once. `proxyctl.py` refuses to
-install `ui` next to its own `router`, since both run a router on 11400, and
-`all` means the single-account three, not `ui`.
+install `ui` next to its own `router`, since both run a router on 11400, and so does
+`gateway/cli.mjs install`; `all` means the single-account three, not `ui`.
+
+### Installing it from another program
+
+`gateway/cli.mjs` is the interface for installers (honcho-agent-bridge's included):
+`install`, `uninstall`, `status`, `connect-info`, `open`, each printing one JSON
+object. It needs only Node. `connect-info` prints the router's client key, and is
+the only command that prints a secret.
 
 ### Several accounts per subscription
 
@@ -77,7 +86,9 @@ consumer terms say the same.
 - **`router/config.json` is not in the repository.** `config.example.json` is the
   template; the real one names backends and which env var holds each key.
 - **Only `codex-openai-proxy` has dependencies** (`@mariozechner/pi-ai`). The other
-  two run from a bare Node.
+  two run from a bare Node. Its `package-lock.json` (what `npm ci` and
+  `cli.mjs install` use) and `pnpm-lock.yaml` pin the same 168 packages at the same
+  versions; change both together.
 - **The owner's LaunchAgents run these files from this checkout.** An edit to an
   adapter reaches the live Honcho path (11435, 11446) the next time that
   LaunchAgent restarts, committed or not.
@@ -116,8 +127,12 @@ cd claude-print-proxy && node --test server.test.mjs   # 60
 cd router            && node --test server.test.mjs    # 42
 cd ui                && node --test server.test.mjs    # 13
 node --test gateway/command.test.mjs                   # 7
+node --test gateway/cli.test.mjs                       # 16 (3 skip on a Windows host)
 python3 -m unittest test_proxyctl.py                   # 5
 ```
+
+`gateway/cli.test.mjs` never reaches launchctl, `reg.exe` or systemctl, and the
+real processes it starts use their own directory and free ports.
 
 ### Licence
 
@@ -133,6 +148,105 @@ AGPL-3.0, retained from the extraction out of the Honcho fork. See `ORIGIN.txt`.
 | Claude | 11446 | Claude Code print mode |
 | Router | 11400 | Dispatch by request `model` to Codex, Claude and Ollama |
 | Screen | 11450 | Logins, accounts, and the router and adapters it keeps running (11460 and up) |
+
+## Command line
+
+`gateway/cli.mjs`, for people and for installers:
+
+```sh
+node gateway/cli.mjs install        # dependencies, keys, autostart, started now
+node gateway/cli.mjs status
+node gateway/cli.mjs connect-info   # prints the router key: never log this output
+node gateway/cli.mjs open
+node gateway/cli.mjs uninstall
+```
+
+Every command prints exactly one JSON object, on one line, on stdout and exits 0.
+A failure prints `{"ok":false,"error":"..."}` and exits 1 (2 for a usage error).
+Diagnostics, if any, go to stderr.
+
+| Command | Output |
+|---|---|
+| `install` | `{"ok":true,"autostart":"launchd","uiUrl":"http://127.0.0.1:11450","routerUrl":"http://127.0.0.1:11400/v1"}` — `autostart` is `launchd`, `windows-run` or `systemd` |
+| `uninstall` | `{"ok":true}` |
+| `status` | `{"ok":true,"ui":{"url":"http://127.0.0.1:11450","ok":true},"router":{"url":"http://127.0.0.1:11400/v1","ok":true},"autostart":{"kind":"launchd","installed":true},"accounts":[{"id":"codex-1","backend":"codex","loggedIn":true,"serving":true}],"models":["gpt-5.5"]}` |
+| `connect-info` | `{"ok":true,"ready":true,"baseUrl":"http://127.0.0.1:11400/v1","apiKey":"<router key>","models":["gpt-5.5"]}`, plus `"reason":"..."` when `ready` is false |
+| `open` | `{"ok":true,"url":"http://127.0.0.1:11450"}` |
+
+- **`install`** runs `npm ci --omit=dev --no-audit --no-fund` in each service
+  folder whose dependencies are missing (today only `codex-openai-proxy`; `npm.cmd`
+  on Windows), creates the app directory and `secrets.json` (keys that exist are
+  kept), registers the autostart below, starts the screen through it and waits up
+  to 30 seconds for `GET /health`. It is idempotent: a second run changes nothing
+  that is already right and does not restart a screen that runs as registered.
+  What cannot work at all (no `systemctl --user`, proxyctl's own
+  `subscription-gateway.router` installed) fails before anything is downloaded. A
+  screen that does not answer in time leaves the autostart registered, and the
+  error names the log to read.
+- **`uninstall`** removes the autostart and stops the screen it runs (on Windows,
+  with its supervisor). Logins, accounts and keys stay. The router and the
+  adapters the screen started are detached and keep running until they are
+  stopped from the screen or the computer restarts.
+- **`status`** is the screen's own `/api/status` when the screen answers, and
+  otherwise the same report made in the CLI, which creates no keys. `router.ok`
+  means the router answers `/health`; `serving` means the router routes to that
+  account.
+- **`connect-info`** is the only command that prints a secret: `apiKey`, the
+  router's client key, sent as `Authorization: Bearer`. Whatever runs it must not
+  log that output, show it, or pass the key on a command line. `ready` is true
+  only when the router just listed at least one model for that key. It creates the
+  keys if there are none yet.
+- **`open`** tries `open`, `rundll32 url.dll,FileProtocolHandler` or `xdg-open`
+  and does not report whether a browser appeared.
+
+The same overrides apply as everywhere else: `GATEWAY_HOME`, `GATEWAY_UI_PORT`,
+`GATEWAY_ROUTER_PORT`, `GATEWAY_ADAPTER_PORT_BASE`, and on macOS proxyctl's
+`GATEWAY_LAUNCHD_PREFIX` and `GATEWAY_STATE_DIR`. `install` writes the gateway
+variables it was run with (`GATEWAY_HOME`, `GATEWAY_USER_HOME`, the two ports,
+`GATEWAY_OLLAMA_BASE_URL`, `CODEX_BIN`, `CLAUDE_BIN`) into the autostart, so the
+screen started at login uses the same directory and ports. Nothing else of the
+installing shell's environment is copied.
+
+| OS | `autostart` | What is registered |
+|---|---|---|
+| macOS | `launchd` | `~/Library/LaunchAgents/subscription-gateway.ui.plist`, byte for byte what `proxyctl.py install ui` writes (a test runs proxyctl.py and compares): RunAtLoad, KeepAlive, `PATH` from where node, codex and claude are plus the system folders, logs in `~/.local/share/subscription-gateway/logs/` |
+| Windows | `windows-run` | the value `SubscriptionGateway` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, which runs `wscript.exe //B //NoLogo <app>\autostart\ui.vbs`; see [Windows](#windows) |
+| Linux | `systemd` | `~/.config/systemd/user/subscription-gateway-ui.service` with `Restart=always` and `KillMode=process` (the router and adapters outlive a restart of the screen). Needs a working `systemctl --user`; `loginctl enable-linger` makes it start without a login session |
+
+None of them needs admin rights.
+
+## Windows
+
+The app directory is `%LOCALAPPDATA%\SubscriptionGateway`. Nothing on Windows
+registers a per-user program without admin rights and restarts it when it exits,
+so the autostart is three parts:
+
+1. The HKCU Run value, which Windows runs at logon with the user's own rights.
+2. `<app>\autostart\ui.vbs`, run by `wscript` so that no console window opens. It
+   sets the screen's variables and starts `gateway/supervise.mjs` hidden.
+3. `gateway/supervise.mjs`, which does what KeepAlive does on macOS: it runs
+   `ui/server.mjs` and starts it again when it exits — after 1 second if it ran for
+   a minute or more, otherwise after 2, 4, 8 … up to 60 seconds. One supervisor
+   runs per app directory, the one holding the pipe
+   `\\.\pipe\subscription-gateway-ui-<hash>`; `install` and `uninstall` ask it
+   over that pipe whether it runs and tell it to stop. Its log is
+   `<app>\logs\ui-supervisor.log`, the screen's `<app>\logs\ui.log`.
+
+`install` starts the same chain right away. Things to know:
+
+- The entry shows up among the startup apps in Task Manager and Settings. Turning
+  it off there is respected: `install` does not turn it back on, and `uninstall`
+  clears that choice along with the entry.
+- VBScript is still installed by default on Windows 11, but Microsoft plans to
+  turn it off by default in a later release. Without it the Run value does nothing:
+  `install` then times out and `ui-supervisor.log` is never written.
+- The screen, the supervisor, the router and the adapters run with folders of
+  the checkout as their working directories, which on Windows keeps the checkout
+  from being renamed or deleted while they run. `uninstall` stops the screen and
+  the supervisor; stop the rest from the screen, or restart, before replacing it.
+- Logging in from the screen shares the screen's hidden console rather than
+  running detached, so no console window opens; a login still waiting for the
+  browser ends if the screen exits.
 
 ## Manage on macOS
 
@@ -154,7 +268,8 @@ python3 proxyctl.py start claude
 For several accounts per subscription, install the screen instead of `router`:
 
 ```sh
-python3 proxyctl.py install ui      # LaunchAgent subscription-gateway.ui on 11450
+node gateway/cli.mjs install        # the same LaunchAgent, plus dependencies and keys
+python3 proxyctl.py install ui      # or: LaunchAgent subscription-gateway.ui on 11450
 python3 proxyctl.py status ui
 python3 proxyctl.py logs ui         # the screen; each service logs under the app directory
 ```

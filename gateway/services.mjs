@@ -5,8 +5,9 @@
 // systemd. The control server spawns each service detached and records its pid,
 // so a CLI or a UI that exits can still find and stop what it started — and so
 // restarting the UI never kills a running proxy. After a reboot they are down
-// until the control server starts; it then brings them up itself, and on macOS
-// `proxyctl.py install ui` has launchd start it at login.
+// until the control server starts; it then brings them up itself, and
+// `cli.mjs install` (or, on macOS, `proxyctl.py install ui`) has the OS start it
+// at login.
 import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -32,6 +33,17 @@ const ADAPTERS = Object.freeze({
 });
 
 const ROUTER_DEFAULT_PORT = 11400;
+
+/**
+ * The service folders with npm dependencies of their own, and the path that is
+ * there once they are installed. `cli.mjs install` runs `npm ci` in each that
+ * lacks it; `serviceStatus` reports the same check as `dependenciesReady`.
+ */
+export function dependencyFolders() {
+  return Object.values(ADAPTERS)
+    .filter(entry => entry.dependenciesSubpath)
+    .map(entry => ({ subdirectory: entry.subdirectory, marker: entry.dependenciesSubpath }));
+}
 
 /** The router, as a service this gateway starts and stops. */
 export function routerService(env = process.env) {
