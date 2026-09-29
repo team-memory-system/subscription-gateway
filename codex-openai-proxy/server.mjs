@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { getModel, getModels, stream as piStream } from '@mariozechner/pi-ai';
+import { getModel, stream as piStream } from '@mariozechner/pi-ai';
 import { getOAuthApiKey } from '@mariozechner/pi-ai/oauth';
 
 const PORT = Number(process.env.PORT || 11435);
@@ -15,6 +15,15 @@ const DEFAULT_MODEL = process.env.DEFAULT_CODEX_MODEL || 'gpt-5.5';
 const SHARED_SECRET = process.env.CODEX_PROXY_SHARED_SECRET || '';
 const MAX_BODY_BYTES = Number(process.env.CODEX_PROXY_MAX_BODY_BYTES || 8 * 1024 * 1024);
 const PROVIDER_ID = 'openai-codex';
+// Where the Codex CLI's own model picker gets its list, per login.
+const MODELS_URL = process.env.CODEX_MODELS_URL || 'https://chatgpt.com/backend-api/codex/models';
+// The backend leaves out a model whose minimal_client_version is newer than the
+// client_version asked with (gpt-6-sol and gpt-6-luna need 0.155.0). This adapter
+// is not the CLI and reaches every model through the same Responses call, so it
+// asks as a client new enough to be shown all of them.
+const MODELS_CLIENT_VERSION = process.env.CODEX_MODELS_CLIENT_VERSION || '9999.0.0';
+const MODELS_TTL_MS = Number(process.env.CODEX_MODELS_TTL_MS || 10 * 60 * 1000);
+const MODELS_RETRY_MS = 30 * 1000;
 
 function isLoopbackHost(host) {
   return host === '127.0.0.1' || host === '::1' || host === 'localhost';
@@ -305,9 +314,43 @@ export class CodexAuthManager {
 
 const authManager = new CodexAuthManager(AUTH_PATH);
 
-function sendJson(res, statusCode, payload) {
-  res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
+function sendJson(res, statusCode, payload, headers = {}) {
+  res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8', ...headers });
   res.end(`${JSON.stringify(payload)}\n`);
+}
+
+// A router in front of this adapter fails over to another account when the
+// answer is 429 with code `usage_limit_reached`. pi-ai reports an exhausted
+// ChatGPT plan as "You have hit your ChatGPT usage limit (<plan> plan). Try
+// again in ~N min." once its own retries are spent. A bare "limit reached" is
+// not enough: "Context limit reached" is a prompt that is too big, and treating
+// it as a usage limit would make the router rest every account for nothing.
+const QUOTA_PATTERN = /usage.?limit|rate.?limit|(?:hit|reached) your [^\n.]{0,40}?\blimit\b|\b(?!(?:context|tokens?|output|input|length|size|max)\b)[\w-]+ limit reached|rate_limit_error|usage_limit_reached|\b429\b/i;
+
+export function classifyUpstreamError(message) {
+  const text = String(message ?? '');
+  if (!QUOTA_PATTERN.test(text)) return { quota: false };
+  const tryAgain = /try again in\s*~?\s*(\d+)\s*min/i.exec(text);
+  return tryAgain
+    ? { quota: true, retryAfterSeconds: Number(tryAgain[1]) * 60 }
+    : { quota: true };
+}
+
+function upstreamErrorMessage(event) {
+  return String(event?.error?.errorMessage || 'Codex upstream request failed');
+}
+
+function sendUpstreamError(res, message) {
+  const { quota, retryAfterSeconds } = classifyUpstreamError(message);
+  if (quota) {
+    return sendJson(
+      res,
+      429,
+      { error: { message, type: 'usage_limit_reached', code: 'usage_limit_reached' } },
+      retryAfterSeconds === undefined ? {} : { 'retry-after': String(retryAfterSeconds) },
+    );
+  }
+  return sendJson(res, 502, { error: { message, type: 'upstream_error', code: 'upstream_error' } });
 }
 
 async function readJsonBody(req) {
@@ -576,7 +619,12 @@ export function resolveReasoningEffort(modelId, body) {
   return modelId === 'gpt-6-astra' && hasImage ? 'low' : undefined;
 }
 
-async function handleChatCompletions(req, res) {
+// `streamFn` and `getAccessToken` are only overridden by tests; the server
+// always runs with the defaults.
+export async function handleChatCompletions(req, res, {
+  streamFn = piStream,
+  getAccessToken = () => authManager.getAccessToken(),
+} = {}) {
   const body = await readJsonBody(req);
   const modelId = body.model || DEFAULT_MODEL;
   // pi-ai's static catalog can lag newly released Codex models. The Codex
@@ -590,8 +638,8 @@ async function handleChatCompletions(req, res) {
   }
   const model = catalogModel || { ...defaultModel, id: modelId, name: modelId };
   const context = convertChatRequest({ ...body, model: modelId });
-  const apiKey = await authManager.getAccessToken();
-  const stream = piStream(model, context, {
+  const apiKey = await getAccessToken();
+  const stream = streamFn(model, context, {
     apiKey,
     transport: 'sse',
     maxTokens: body.max_completion_tokens ?? body.max_tokens,
@@ -609,18 +657,44 @@ async function handleChatCompletions(req, res) {
     let sentRole = false;
     let toolIndex = 0;
 
-    res.writeHead(200, {
-      'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache, no-transform',
-      connection: 'keep-alive',
-    });
+    // The SSE status line waits for the first event. pi-ai pushes `start`
+    // before any content on success, and an `error` with no `start` when the
+    // upstream request failed (quota included); that failure has to reach the
+    // caller as a non-2xx JSON answer, not as an empty 200 stream.
+    let sseStarted = false;
+    const startSse = () => {
+      if (sseStarted) return;
+      sseStarted = true;
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+      });
+    };
 
     const writeEvent = (payload) => {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     };
 
+    const writeStreamError = (message) => {
+      startSse();
+      res.write(`data: ${JSON.stringify({ error: { message } })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    };
+
     try {
       for await (const event of stream) {
+        if (event.type === 'error') {
+          if (!sseStarted) {
+            sendUpstreamError(res, upstreamErrorMessage(event));
+          } else {
+            writeStreamError(upstreamErrorMessage(event));
+          }
+          return;
+        }
+        startSse();
+
         if (!sentRole && (event.type === 'text_start' || event.type === 'toolcall_start' || event.type === 'thinking_start')) {
           writeEvent({
             ...createChunkBase(id, modelId, created),
@@ -687,18 +761,18 @@ async function handleChatCompletions(req, res) {
           }
         }
       }
+      startSse();
       res.write('data: [DONE]\n\n');
       res.end();
       return;
     } catch (error) {
-      res.write(`data: ${JSON.stringify({ error: { message: String(error?.message || error) } })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
+      writeStreamError(String(error?.message || error));
       return;
     }
   }
 
   let assistant = null;
+  let upstreamError = null;
   const seenEvents = [];
   for await (const event of stream) {
     seenEvents.push(event.type);
@@ -706,12 +780,17 @@ async function handleChatCompletions(req, res) {
       assistant = event.message;
     }
     if (event.type === 'error') {
+      upstreamError = upstreamErrorMessage(event);
       console.error('[codex-proxy] non-stream error event', {
         model: modelId,
         message_roles: (body.messages || []).map((msg) => msg.role),
         event,
       });
     }
+  }
+  if (!assistant && upstreamError !== null) {
+    sendUpstreamError(res, upstreamError);
+    return;
   }
   if (!assistant) {
     console.error('[codex-proxy] no assistant response', {
@@ -742,22 +821,70 @@ async function handleChatCompletions(req, res) {
   });
 }
 
-// The models this adapter has metadata for, which is what a dispatcher in front of
-// it can route by. A name outside this list is still forwarded when a request
-// names it explicitly; handleChatCompletions falls back to the default model's
-// shape. Listing only what is known keeps the reply from claiming more than it can
-// describe.
-export function listModels() {
-  const catalog = getModels(PROVIDER_ID);
-  const entries = Array.isArray(catalog) ? catalog : Object.values(catalog || {});
-  const ids = new Set();
-  for (const entry of entries) {
-    const id = entry && (entry.id || entry.slug);
-    if (typeof id === 'string' && id) ids.add(id);
-  }
-  ids.add(DEFAULT_MODEL);
-  return [...ids].sort().map(id => ({ id, object: 'model', owned_by: PROVIDER_ID }));
+function chatgptAccountId(token) {
+  const payload = JSON.parse(Buffer.from(String(token).split('.')[1] || '', 'base64url').toString('utf8'));
+  const id = payload?.['https://api.openai.com/auth']?.chatgpt_account_id;
+  if (typeof id !== 'string' || !id) throw new Error('the access token names no ChatGPT account');
+  return id;
 }
+
+// The models this login can use, as the backend lists them for the Codex CLI's
+// picker, in the backend's order. pi-ai's static catalog is not that list: on
+// 2026-09-29 it named none of the gpt-6 or gpt-5.6 models, and nine of its ten ids
+// were refused for a ChatGPT login ("not supported when using Codex with a ChatGPT
+// account"). A name outside the list is still forwarded when a request names it;
+// handleChatCompletions falls back to the default model's shape.
+export async function fetchAccountModels({
+  fetchImpl = globalThis.fetch,
+  getAccessToken = () => authManager.getAccessToken(),
+} = {}) {
+  const token = await getAccessToken();
+  const url = new URL(MODELS_URL);
+  url.searchParams.set('client_version', MODELS_CLIENT_VERSION);
+  const response = await fetchImpl(url, {
+    headers: { authorization: `Bearer ${token}`, 'chatgpt-account-id': chatgptAccountId(token), originator: 'pi' },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`the model list answered HTTP ${response.status}`);
+  const body = await response.json();
+  // "hide" is what the CLI's picker leaves out too (a reviewer model, a reserve).
+  const ids = (Array.isArray(body?.models) ? body.models : [])
+    .filter(model => model && typeof model.slug === 'string' && model.slug && model.visibility === 'list')
+    .map(model => model.slug);
+  if (!ids.length) throw new Error('the model list was empty');
+  return [...new Set(ids)];
+}
+
+// `/v1/models`, asked of the backend at most every MODELS_TTL_MS. A failed refresh
+// keeps the last good list and is tried again after MODELS_RETRY_MS. Before any
+// list has arrived only the default model is claimed, since that is what a request
+// without a model gets anyway.
+export function createModelLister({
+  fetchModels = fetchAccountModels,
+  now = Date.now,
+  ttlMs = MODELS_TTL_MS,
+  retryMs = MODELS_RETRY_MS,
+  fallbackIds = [DEFAULT_MODEL],
+} = {}) {
+  let ids = null;
+  let dueAt = 0;
+  let pending = null;
+  return async function listModels() {
+    if (now() >= dueAt) {
+      pending ||= fetchModels()
+        .then((list) => { ids = list; dueAt = now() + ttlMs; })
+        .catch((error) => {
+          dueAt = now() + retryMs;
+          console.error('[codex-proxy] model list refresh failed', { error: String(error?.message || error) });
+        })
+        .finally(() => { pending = null; });
+      await pending;
+    }
+    return (ids || fallbackIds).map(id => ({ id, object: 'model', owned_by: PROVIDER_ID }));
+  };
+}
+
+const listModels = createModelLister();
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -767,7 +894,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && req.url === '/v1/models') {
       if (!authorized(req)) return sendJson(res, 401, { error: 'Unauthorized' });
-      return sendJson(res, 200, { object: 'list', data: listModels() });
+      return sendJson(res, 200, { object: 'list', data: await listModels() });
     }
 
     if (req.method === 'POST' && req.url === '/v1/chat/completions') {

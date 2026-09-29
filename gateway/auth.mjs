@@ -1,11 +1,12 @@
-// Login state and login/logout for each subscription backend.
+// Login state and login/logout for each subscription account.
 //
 // Both CLIs can be pointed at a different configuration directory, and both then
 // look for credentials only there. That is what keeps this gateway's login
-// separate from the user's own:
+// separate from the user's own, and what lets one backend hold several logins:
+// every account is its own directory.
 //
-//   CODEX_HOME=<dir>        codex login status   -> "Not logged in" in a fresh dir
-//   CLAUDE_CONFIG_DIR=<dir> claude auth status   -> {"loggedIn": false, ...}
+//   CODEX_HOME=<dir>        codex login status   -> "Not logged in" on stderr, exit 1, in a fresh dir
+//   CLAUDE_CONFIG_DIR=<dir> claude auth status   -> {"loggedIn": false, ...} on stdout
 //
 // So nothing is ever copied out of ~/.codex or ~/.claude, and the Codex adapter's
 // refresh-token rotation has a single writer.
@@ -55,17 +56,52 @@ export function backendBin(entry, env = process.env) {
   return String(env[entry.binEnv] || "").trim() || entry.defaultBin;
 }
 
-/** The environment that makes a CLI use this gateway's own credentials. */
-export function authEnvironment(entry, { paths = gatewayPaths(), env = process.env } = {}) {
-  return { ...env, [entry.homeEnv]: paths.authDir(entry.name) };
+/** Where one account's CLI configuration lives. */
+export function accountDirectory(account, paths = gatewayPaths()) {
+  return paths.authDir(account.backend, account.id);
 }
 
-function parseCodexStatus(stdout) {
-  const text = String(stdout || "");
+/** The environment that makes a CLI use one account's credentials. */
+export function authEnvironment(account, { paths = gatewayPaths(), env = process.env } = {}) {
+  const entry = backend(account.backend);
+  return { ...env, [entry.homeEnv]: accountDirectory(account, paths) };
+}
+
+/**
+ * Who a Codex login belongs to. `codex login status` only says "Logged in using
+ * ChatGPT", which cannot tell two accounts apart, so the email and plan are read
+ * from the id token's claims. Nothing but those two fields leaves this function.
+ */
+async function codexIdentity(directory) {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(path.join(directory, "auth.json"), "utf8"));
+    const token = parsed?.tokens?.id_token;
+    if (typeof token !== "string") return {};
+    const claims = JSON.parse(Buffer.from(token.split(".")[1] || "", "base64url").toString("utf8"));
+    const auth = claims?.["https://api.openai.com/auth"] || {};
+    return {
+      account: typeof claims?.email === "string" ? claims.email : undefined,
+      plan: typeof auth.chatgpt_plan_type === "string" ? auth.chatgpt_plan_type : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function parseCodexStatus(output) {
+  const text = String(output || "");
   if (/not logged in/i.test(text)) return { loggedIn: false };
   const match = text.match(/logged in(?:\s+using\s+(.+))?/i);
   if (match) return { loggedIn: true, method: (match[1] || "").trim() || undefined };
-  return { loggedIn: false, unrecognized: text.trim().slice(0, 200) || undefined };
+  return { loggedIn: false, unrecognized: text.trim().slice(0, 200) };
+}
+
+// codex-cli 0.154 prints "Logged in using ChatGPT" (exit 0) and "Not logged in"
+// (exit 1) on stderr, not stdout, so Codex is read from both streams. Claude's
+// JSON is on stdout, and a warning on its stderr must not spoil the parse.
+function parseStatus(name, output) {
+  if (name === "codex") return parseCodexStatus([output?.stdout, output?.stderr].filter(Boolean).join("\n"));
+  return parseClaudeStatus(output?.stdout);
 }
 
 function parseClaudeStatus(stdout) {
@@ -78,7 +114,7 @@ function parseClaudeStatus(stdout) {
       account: parsed.email || undefined,
     };
   } catch {
-    return { loggedIn: false, unrecognized: String(stdout || "").trim().slice(0, 200) || undefined };
+    return { loggedIn: false, unrecognized: String(stdout || "").trim().slice(0, 200) };
   }
 }
 
@@ -87,16 +123,18 @@ function parseClaudeStatus(stdout) {
  * whether what it has is still usable. The credential file is reported too,
  * because the adapter needs that path and its absence explains a failed start.
  */
-export async function loginStatus(name, { paths = gatewayPaths(), env = process.env, runner = execFileAsync } = {}) {
+export async function loginStatus(account, { paths = gatewayPaths(), env = process.env, runner = execFileAsync } = {}) {
+  const name = account.backend;
   const entry = backend(name);
-  const directory = paths.authDir(name);
+  const directory = accountDirectory(account, paths);
   const credentialPath = path.join(directory, entry.credentialFile);
   const credentialPresent = await fsp.access(credentialPath).then(() => true, () => false);
-  const base = { backend: name, label: entry.label, directory, credentialPath, credentialPresent };
+  const base = { accountId: account.id, backend: name, label: entry.label, directory, credentialPath, credentialPresent };
+  const identity = name === "codex" && credentialPresent ? await codexIdentity(directory) : {};
   let result;
   try {
     result = await runner(backendBin(entry, env), entry.statusArgs, {
-      env: authEnvironment(entry, { paths, env }),
+      env: authEnvironment(account, { paths, env }),
       timeout: 30_000,
     });
   } catch (error) {
@@ -105,13 +143,17 @@ export async function loginStatus(name, { paths = gatewayPaths(), env = process.
     if (error?.code === "ENOENT") {
       return { ...base, loggedIn: false, cliAvailable: false, error: `${backendBin(entry, env)} is not installed` };
     }
-    const stdout = error?.stdout || "";
-    const parsed = name === "codex" ? parseCodexStatus(stdout) : parseClaudeStatus(stdout);
-    if (parsed.loggedIn || parsed.unrecognized === undefined) return { ...base, cliAvailable: true, ...parsed };
+    const parsed = parseStatus(name, error);
+    if (parsed.loggedIn || parsed.unrecognized === undefined) return { ...base, cliAvailable: true, ...identity, ...parsed };
     return { ...base, loggedIn: false, cliAvailable: true, error: shortError(error) };
   }
-  const parsed = name === "codex" ? parseCodexStatus(result.stdout) : parseClaudeStatus(result.stdout);
-  return { ...base, cliAvailable: true, ...parsed };
+  const parsed = parseStatus(name, result);
+  // An answer this cannot read is shown as one, not taken for "not logged in":
+  // that is how a CLI printing to the other stream once went unnoticed.
+  if (parsed.unrecognized !== undefined) {
+    return { ...base, cliAvailable: true, ...identity, ...parsed, error: `로그인 상태를 알아볼 수 없습니다: ${parsed.unrecognized || "출력 없음"}` };
+  }
+  return { ...base, cliAvailable: true, ...identity, ...parsed };
 }
 
 function shortError(error) {
@@ -125,40 +167,40 @@ function shortError(error) {
  * Output goes to a log file because a detached process with no stdout can wedge
  * a CLI that still tries to print.
  */
-export async function startLogin(name, {
+export async function startLogin(account, {
   paths = gatewayPaths(),
   env = process.env,
   spawnImpl = spawn,
 } = {}) {
-  const entry = backend(name);
-  await fsp.mkdir(paths.authDir(name), { recursive: true });
+  const entry = backend(account.backend);
+  await fsp.mkdir(accountDirectory(account, paths), { recursive: true });
   await fsp.mkdir(paths.logDir, { recursive: true });
-  const logPath = paths.logFile(`login-${name}`);
+  const logPath = paths.logFile(`login-${account.id}`);
   const handle = await fsp.open(logPath, "a");
   try {
     const child = spawnImpl(backendBin(entry, env), entry.loginArgs, {
-      env: authEnvironment(entry, { paths, env }),
+      env: authEnvironment(account, { paths, env }),
       detached: true,
       stdio: ["ignore", handle.fd, handle.fd],
     });
     child.unref();
-    return { ok: true, started: true, backend: name, pid: child.pid ?? null, logPath };
+    return { ok: true, started: true, accountId: account.id, backend: account.backend, pid: child.pid ?? null, logPath };
   } catch (error) {
-    return { ok: false, started: false, backend: name, error: shortError(error) };
+    return { ok: false, started: false, accountId: account.id, backend: account.backend, error: shortError(error) };
   } finally {
     await handle.close();
   }
 }
 
-export async function logout(name, { paths = gatewayPaths(), env = process.env, runner = execFileAsync } = {}) {
-  const entry = backend(name);
+export async function logout(account, { paths = gatewayPaths(), env = process.env, runner = execFileAsync } = {}) {
+  const entry = backend(account.backend);
   try {
     await runner(backendBin(entry, env), entry.logoutArgs, {
-      env: authEnvironment(entry, { paths, env }),
+      env: authEnvironment(account, { paths, env }),
       timeout: 60_000,
     });
-    return { ok: true, backend: name };
+    return { ok: true, accountId: account.id, backend: account.backend };
   } catch (error) {
-    return { ok: false, backend: name, error: shortError(error) };
+    return { ok: false, accountId: account.id, backend: account.backend, error: shortError(error) };
   }
 }

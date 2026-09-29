@@ -10,15 +10,24 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  addAccount,
+  findAccount,
+  MODES,
+  moveAccount,
+  readAccounts,
+  removeAccount,
+  setMode,
+} from "../gateway/accounts.mjs";
 import { BACKENDS, loginStatus, logout, startLogin } from "../gateway/auth.mjs";
 import { gatewayPaths } from "../gateway/paths.mjs";
 import { loadSecrets, SECRET_ENV } from "../gateway/secrets.mjs";
 import {
+  adapterService,
   routerConfig,
-  SERVICES,
+  routerService,
   serviceStatus,
   serviceUrl,
-  service,
   startService,
   stopService,
   writeRouterConfig,
@@ -91,42 +100,63 @@ async function readJsonBody(req) {
   }
 }
 
-function enabledBackends(logins) {
-  return BACKENDS.filter(entry => logins[entry.name]?.loggedIn).map(entry => entry.name);
+/** The router's own view of each account: cooldowns and how much it has been used. */
+function routingByAccount(routerStatus) {
+  const backends = routerStatus?.health?.body?.backends;
+  if (!Array.isArray(backends)) return {};
+  return Object.fromEntries(backends
+    .filter(entry => entry && typeof entry.name === "string" && entry.routing)
+    .map(entry => [entry.name, entry.routing]));
 }
 
 /** Everything the screen draws. No secret is part of this. */
-export async function statusReport({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch } = {}) {
-  const [{ secrets }, logins, services] = await Promise.all([
+export async function statusReport({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, runner } = {}) {
+  const state = await readAccounts({ paths });
+  const ask = runner ? { paths, env, runner } : { paths, env };
+  const router = routerService(env);
+  const [{ secrets }, logins, adapters, routerStatus] = await Promise.all([
     loadSecrets({ paths }),
-    Promise.all(BACKENDS.map(entry => loginStatus(entry.name, { paths, env }))).then(list =>
-      Object.fromEntries(list.map(entry => [entry.backend, entry]))),
-    Promise.all(SERVICES.map(entry => serviceStatus(entry.name, { paths, env, fetchImpl }))),
+    Promise.all(state.accounts.map(account => loginStatus(account, ask))),
+    Promise.all(state.accounts.map(account => serviceStatus(adapterService(account), { paths, fetchImpl }))),
+    serviceStatus(router, { paths, fetchImpl }),
   ]);
-  const router = services.find(entry => entry.name === "router");
   let models = { ok: false, reason: "라우터가 실행 중이 아닙니다" };
-  if (router?.running) {
+  if (routerStatus.running) {
     models = await routerModels({ secrets, env, fetchImpl });
   }
-  const adaptersUp = services.filter(entry => entry.name !== "router" && entry.running).map(entry => entry.name);
+  const routing = routingByAccount(routerStatus);
+  const accounts = state.accounts.map((account, index) => ({
+    ...account,
+    login: logins[index],
+    service: adapters[index],
+    routing: routing[account.id] || null,
+  }));
+  // Serving means the router routes to it, not only that its adapter is up: an
+  // adapter started after the router is invisible to it until a reconnect.
+  const serving = accounts
+    .filter(account => account.service.running && account.routing)
+    .map(account => account.id);
   return {
     ok: true,
     appHome: paths.appHome,
     secretEnvNames: SECRET_ENV,
-    logins,
-    services,
+    mode: state.mode,
+    modes: MODES,
+    backends: BACKENDS.map(entry => ({ name: entry.name, label: entry.label })),
+    accounts,
+    services: [...adapters, routerStatus],
     models,
-    ready: enabledBackends(logins).length > 0,
+    ready: accounts.some(account => account.login.loggedIn),
     // The one address anything else should be pointed at, and whether it is
-    // actually answering for at least one backend right now.
-    endpoint: `${serviceUrl(service("router"), env)}/v1`,
-    connected: Boolean(router?.running) && adaptersUp.length > 0,
-    servingBackends: adaptersUp,
+    // actually answering for at least one account right now.
+    endpoint: `${serviceUrl(router)}/v1`,
+    connected: routerStatus.running && serving.length > 0,
+    servingAccounts: serving,
   };
 }
 
 async function routerModels({ secrets, env = process.env, fetchImpl = globalThis.fetch }) {
-  const url = `${serviceUrl(service("router"), env)}/v1/models`;
+  const url = `${serviceUrl(routerService(env))}/v1/models`;
   try {
     const response = await fetchImpl(url, {
       headers: { authorization: `Bearer ${secrets.router}` },
@@ -154,7 +184,7 @@ export async function chatTest({
   const text = String(prompt || "").trim();
   if (!chosen) return { ok: false, error: "모델을 고르세요" };
   if (!text) return { ok: false, error: "보낼 말을 적으세요" };
-  const router = await serviceStatus("router", { paths, env, fetchImpl });
+  const router = await serviceStatus(routerService(env), { paths, fetchImpl });
   if (!router.running) {
     // Never quietly fall back to a backend's own port: that would test a path
     // nobody uses and hide the fact that the dispatcher is down.
@@ -163,7 +193,7 @@ export async function chatTest({
   const { secrets } = await loadSecrets({ paths });
   const started = Date.now();
   try {
-    const response = await fetchImpl(`${serviceUrl(service("router"), env)}/v1/chat/completions`, {
+    const response = await fetchImpl(`${serviceUrl(routerService(env))}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${secrets.router}` },
       body: JSON.stringify({ model: chosen, messages: [{ role: "user", content: text }], stream: false }),
@@ -196,57 +226,70 @@ function firstLine(text) {
   return String(text || "").trim().split(/\r?\n/)[0].slice(0, 400);
 }
 
+async function loggedInAccounts({ paths, env, runner }) {
+  const state = await readAccounts({ paths });
+  const ask = runner ? { paths, env, runner } : { paths, env };
+  const logins = await Promise.all(state.accounts.map(account => loginStatus(account, ask)));
+  return { mode: state.mode, accounts: state.accounts.filter((_, index) => logins[index].loggedIn) };
+}
+
 /**
  * Everything a login should have caused. Logging in is the only decision a person
  * makes here; which processes that implies, and the order they have to come up in,
  * is this file's problem, not theirs.
  *
  * The router is restarted rather than left alone because it reads its backend list
- * once at startup: a backend logged in afterwards would be invisible to it.
+ * once at startup: an account logged in afterwards would be invisible to it. The
+ * restart also clears the router's cooldowns, which live only in its memory.
  */
 export async function connect({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, runner, starter = startService, stopper = stopService } = {}) {
-  const ask = runner ? { paths, env, runner } : { paths, env };
-  const logins = await Promise.all(BACKENDS.map(entry => loginStatus(entry.name, ask)));
-  const ready = logins.filter(entry => entry.loggedIn).map(entry => entry.backend);
-  if (!ready.length) {
-    return { ok: false, error: "로그인된 것이 없습니다. 먼저 로그인하세요", steps: [] };
+  const { mode, accounts } = await loggedInAccounts({ paths, env, runner });
+  if (!accounts.length) {
+    return { ok: false, error: "로그인된 계정이 없습니다. 먼저 로그인하세요", steps: [] };
   }
   const { secrets } = await loadSecrets({ paths });
   const steps = [];
-  for (const name of ready) {
-    const result = await starter(name, { secrets, paths, env, fetchImpl });
-    steps.push({ service: name, ok: result.ok, alreadyRunning: Boolean(result.alreadyRunning), error: result.error });
+  for (const account of accounts) {
+    const result = await starter(adapterService(account), { secrets, paths, env, fetchImpl });
+    steps.push({ service: account.id, ok: result.ok, alreadyRunning: Boolean(result.alreadyRunning), error: result.error });
   }
-  const applied = await applyRouterConfig({ backends: ready, paths, env });
+  const applied = await applyRouterConfig({ accounts, mode, paths, env });
   if (!applied.ok) return { ok: false, error: applied.error, steps };
-  // Stop first: a router already up is holding the previous backend list.
-  await stopper("router", { paths, env, fetchImpl });
-  const router = await starter("router", { secrets, paths, env, fetchImpl });
-  steps.push({ service: "router", ok: router.ok, error: router.error });
+  const router = routerService(env);
+  // Stop first: a router already up is holding the previous account list.
+  await stopper(router, { paths, env, fetchImpl });
+  const started = await starter(router, { secrets, paths, env, fetchImpl });
+  steps.push({ service: "router", ok: started.ok, error: started.error });
   const failed = steps.filter(step => !step.ok);
   return {
     ok: failed.length === 0,
-    connected: ready,
+    connected: accounts.map(account => account.id),
+    mode,
     steps,
     ...(failed.length ? { error: failed.map(step => step.error || `${step.service}를 시작하지 못했습니다`).join(" / ") } : {}),
   };
 }
 
-/** Takes the backend list its caller already established rather than asking again. */
-async function applyRouterConfig({ backends, paths, env }) {
-  if (!backends.length) {
-    return { ok: false, error: "로그인된 백엔드가 없습니다. 먼저 로그인하세요" };
+/** Takes the account list its caller already established rather than asking again. */
+async function applyRouterConfig({ accounts, mode, paths, env }) {
+  if (!accounts.length) {
+    return { ok: false, error: "로그인된 계정이 없습니다. 먼저 로그인하세요" };
   }
   const ollamaBaseUrl = String(env.GATEWAY_OLLAMA_BASE_URL || "").trim();
-  const config = routerConfig({ backends, env, ollamaBaseUrl });
+  const config = routerConfig({ accounts, mode, env, ollamaBaseUrl });
   const file = await writeRouterConfig(config, { paths });
-  return { ok: true, backends, configPath: file };
+  return { ok: true, accounts: accounts.map(account => account.id), mode, configPath: file };
 }
 
-async function loggedInBackends({ paths, env, runner }) {
-  const ask = runner ? { paths, env, runner } : { paths, env };
-  const logins = await Promise.all(BACKENDS.map(entry => loginStatus(entry.name, ask)));
-  return logins.filter(entry => entry.loggedIn).map(entry => entry.backend);
+/** A service by the key the screen knows it by: "router", or an account id. */
+async function serviceByKey(key, { paths, env }) {
+  if (key === "router") return routerService(env);
+  const account = findAccount(await readAccounts({ paths }), key);
+  return account ? adapterService(account) : null;
+}
+
+async function accountById(id, paths) {
+  return findAccount(await readAccounts({ paths }), String(id || ""));
 }
 
 export function createHandler({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, port } = {}) {
@@ -279,12 +322,46 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
       if (req.method === "GET" && url.pathname === "/api/status") {
         return json(res, 200, await statusReport({ paths, env, fetchImpl }));
       }
+      if (req.method === "POST" && url.pathname === "/api/accounts/add") {
+        // Adding an account is only ever done to log into it, so both happen here.
+        const backendName = String(body.backend || "");
+        if (!BACKENDS.some(entry => entry.name === backendName)) {
+          return json(res, 400, { ok: false, error: `백엔드는 ${BACKENDS.map(entry => entry.name).join(", ")} 중 하나입니다` });
+        }
+        const account = await addAccount(backendName, { paths, env });
+        const login = await startLogin(account, { paths, env });
+        return json(res, login.ok ? 200 : 400, { ok: login.ok, account, login, error: login.error });
+      }
+      if (req.method === "POST" && url.pathname === "/api/accounts/remove") {
+        const account = await accountById(body.account, paths);
+        if (!account) return json(res, 404, { ok: false, error: "그런 계정이 없습니다" });
+        // What was serving it goes first, then its login, then its directory.
+        const stopped = await stopService(adapterService(account), { paths, fetchImpl });
+        const loggedOut = await logout(account, { paths, env });
+        await removeAccount(account.id, { paths });
+        return json(res, 200, { ok: true, removed: account.id, stopped: stopped.ok, loggedOut: loggedOut.ok });
+      }
+      if (req.method === "POST" && url.pathname === "/api/accounts/move") {
+        const moved = await moveAccount(String(body.account || ""), String(body.direction || ""), { paths });
+        if (!moved) return json(res, 404, { ok: false, error: "그런 계정이 없습니다" });
+        return json(res, 200, { ok: true, accounts: moved.accounts.map(account => account.id) });
+      }
+      if (req.method === "POST" && url.pathname === "/api/mode") {
+        const mode = String(body.mode || "");
+        if (!MODES.includes(mode)) return json(res, 400, { ok: false, error: `모드는 ${MODES.join(", ")} 중 하나입니다` });
+        await setMode(mode, { paths });
+        return json(res, 200, { ok: true, mode });
+      }
       if (req.method === "POST" && url.pathname === "/api/login") {
-        const result = await startLogin(String(body.backend || ""), { paths, env });
+        const account = await accountById(body.account, paths);
+        if (!account) return json(res, 404, { ok: false, error: "그런 계정이 없습니다" });
+        const result = await startLogin(account, { paths, env });
         return json(res, result.ok ? 200 : 400, result);
       }
       if (req.method === "POST" && url.pathname === "/api/logout") {
-        const result = await logout(String(body.backend || ""), { paths, env });
+        const account = await accountById(body.account, paths);
+        if (!account) return json(res, 404, { ok: false, error: "그런 계정이 없습니다" });
+        const result = await logout(account, { paths, env });
         return json(res, result.ok ? 200 : 400, result);
       }
       if (req.method === "POST" && url.pathname === "/api/connect") {
@@ -292,22 +369,25 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
         return json(res, result.ok ? 200 : 400, result);
       }
       if (req.method === "POST" && url.pathname === "/api/router-config") {
-        const backends = await loggedInBackends({ paths, env });
-        return json(res, 200, await applyRouterConfig({ backends, paths, env }));
+        const { mode, accounts } = await loggedInAccounts({ paths, env });
+        return json(res, 200, await applyRouterConfig({ accounts, mode, paths, env }));
       }
       if (req.method === "POST" && url.pathname === "/api/start") {
-        const name = String(body.service || "");
+        const entry = await serviceByKey(String(body.service || ""), { paths, env });
+        if (!entry) return json(res, 404, { ok: false, error: "그런 서비스가 없습니다" });
         const { secrets } = await loadSecrets({ paths });
-        if (name === "router") {
-          const backends = await loggedInBackends({ paths, env });
-          const applied = await applyRouterConfig({ backends, paths, env });
+        if (entry.kind === "router") {
+          const { mode, accounts } = await loggedInAccounts({ paths, env });
+          const applied = await applyRouterConfig({ accounts, mode, paths, env });
           if (!applied.ok) return json(res, 400, applied);
         }
-        const result = await startService(name, { secrets, paths, env, fetchImpl });
+        const result = await startService(entry, { secrets, paths, env, fetchImpl });
         return json(res, result.ok ? 200 : 400, result);
       }
       if (req.method === "POST" && url.pathname === "/api/stop") {
-        const result = await stopService(String(body.service || ""), { paths, env, fetchImpl });
+        const entry = await serviceByKey(String(body.service || ""), { paths, env });
+        if (!entry) return json(res, 404, { ok: false, error: "그런 서비스가 없습니다" });
+        const result = await stopService(entry, { paths, fetchImpl });
         return json(res, result.ok ? 200 : 400, result);
       }
       if (req.method === "POST" && url.pathname === "/api/chat") {

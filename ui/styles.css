@@ -164,3 +164,23 @@ details#detail-card > summary {
   color: var(--muted);
 }
 .detail-body { display: grid; gap: 10px; padding-top: 12px; }
+
+.modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.mode {
+  display: grid;
+  gap: 2px;
+  text-align: left;
+  padding: 10px 13px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 13.5px;
+}
+.mode strong { font-size: 14px; }
+.mode span { color: var(--muted); font-size: 12.5px; }
+.mode[aria-checked="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.mode[aria-checked="true"] strong { color: var(--accent); }
+.groups { display: grid; gap: 16px; }
+.group { display: grid; gap: 8px; }
+.group h3 { font-size: 14px; margin: 0; }
+.group > button { justify-self: start; }
+.badge.wait { color: var(--muted); background: var(--ground); border: 1px solid var(--line); }

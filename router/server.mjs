@@ -5,6 +5,8 @@
 // the backends accept non-standard fields (`reasoning_effort`, legacy display
 // suffixes such as ` [low] vision`) that any normalization here would destroy.
 // Streaming responses are piped through as bytes, never parsed and re-emitted.
+// When several backends (accounts) serve one model, in-memory per-account state
+// picks among them and a usage limit fails over; see "Account routing".
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
@@ -29,6 +31,18 @@ export const DEFAULTS = Object.freeze({
   maxBodyBytes: 8 * 1024 * 1024,
   clientAuthEnv: 'ROUTER_PROXY_SHARED_SECRET',
 });
+
+// Account selection when several backends serve one model (e.g. `codex-1`,
+// `codex-2`: accounts of one subscription). `drain` keeps today's behavior for
+// a single backend: the first one in config order takes every request.
+export const ROUTING_DEFAULTS = Object.freeze({
+  mode: 'drain',
+  windowMs: 5 * 60 * 60 * 1000,
+  defaultCooldownMs: 15 * 60 * 1000,
+  maxCooldownMs: 6 * 60 * 60 * 1000,
+  unreachableCooldownMs: 30 * 1000,
+});
+const ROUTING_MODES = ['drain', 'balance'];
 
 const LEGACY_LABEL_SUFFIX = /\s+\[(?:low|medium|high|xhigh|max)\](?:\s+vision)?$/i;
 const OLLAMA_DEFAULT_TAG = ':latest';
@@ -119,6 +133,24 @@ function normalizeBackend(raw, index) {
   return { name, baseUrl, models, aliases, discoverModels, apiKeyEnv };
 }
 
+function normalizeRouting(raw, env) {
+  if (raw != null && (typeof raw !== 'object' || Array.isArray(raw))) throw new Error('config.routing must be an object');
+  const routing = raw || {};
+  // Same convention as the numeric settings: a set-but-empty env var falls through.
+  const envMode = typeof env.ROUTER_ROUTING_MODE === 'string' ? env.ROUTER_ROUTING_MODE.trim() : '';
+  const mode = envMode || (routing.mode == null ? ROUTING_DEFAULTS.mode : routing.mode);
+  if (!ROUTING_MODES.includes(mode)) {
+    throw new Error(`routing.mode must be one of ${ROUTING_MODES.map((m) => `"${m}"`).join(', ')}; got ${JSON.stringify(mode)}`);
+  }
+  return {
+    mode,
+    windowMs: positiveNumber(routing.windowMs, ROUTING_DEFAULTS.windowMs),
+    defaultCooldownMs: positiveNumber(routing.defaultCooldownMs, ROUTING_DEFAULTS.defaultCooldownMs),
+    maxCooldownMs: positiveNumber(routing.maxCooldownMs, ROUTING_DEFAULTS.maxCooldownMs),
+    unreachableCooldownMs: positiveNumber(routing.unreachableCooldownMs, ROUTING_DEFAULTS.unreachableCooldownMs),
+  };
+}
+
 export function normalizeConfig(raw = {}, env = process.env) {
   const listen = raw.listen && typeof raw.listen === 'object' ? raw.listen : raw;
   const host = env.HOST || listen.host || DEFAULTS.host;
@@ -140,6 +172,7 @@ export function normalizeConfig(raw = {}, env = process.env) {
     modelsTtlMs: numberSetting(env.ROUTER_MODELS_TTL_MS, raw.modelsTtlMs, DEFAULTS.modelsTtlMs),
     maxBodyBytes: numberSetting(env.ROUTER_MAX_BODY_BYTES, raw.maxBodyBytes, DEFAULTS.maxBodyBytes),
     clientAuthEnv: (typeof raw.clientAuthEnv === 'string' && raw.clientAuthEnv.trim()) || DEFAULTS.clientAuthEnv,
+    routing: normalizeRouting(raw.routing, env),
   };
 }
 
@@ -179,8 +212,8 @@ function httpError(statusCode, message, extra = {}) {
   return error;
 }
 
-function sendJson(res, statusCode, payload) {
-  res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
+function sendJson(res, statusCode, payload, headers = {}) {
+  res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8', ...headers });
   res.end(`${JSON.stringify(payload)}\n`);
 }
 
@@ -193,7 +226,7 @@ function errorType(statusCode, explicit) {
   return 'invalid_request_error';
 }
 
-function sendError(res, statusCode, message, extra = {}) {
+function sendError(res, statusCode, message, extra = {}, headers = {}) {
   sendJson(res, statusCode, {
     error: {
       message: redact(message),
@@ -201,7 +234,7 @@ function sendError(res, statusCode, message, extra = {}) {
       param: extra.param ?? null,
       code: extra.code ?? null,
     },
-  });
+  }, headers);
 }
 
 async function readBody(req, maxBytes) {
@@ -325,18 +358,16 @@ export function createRegistry(config, { fetchImpl = fetch, env = process.env, n
     return rows;
   }
 
-  // Static ids resolve with no upstream traffic at all, so a dispatch to a
-  // configured model never waits on a discovery call.
-  function resolveStatic(model) {
-    const index = new Map();
-    for (const backend of config.backends) {
-      for (const id of [...backend.models, ...backend.aliases]) if (!index.has(id)) index.set(id, backend);
-    }
-    for (const candidate of lookupCandidates(model)) {
-      const backend = index.get(candidate);
-      if (backend) return backend;
-    }
-    return null;
+  // Every backend that serves the model, statically or by discovery, in config
+  // order (the user's priority order), each once. With no discovering backend
+  // this makes no upstream call; otherwise it waits on the cached discovery
+  // (at most one call per backend per modelsTtlMs), because an account that
+  // only discovers a model is still a failover target for it.
+  async function candidates(model) {
+    const keys = new Set(lookupCandidates(model));
+    const serving = new Set();
+    for (const row of await table()) if (keys.has(row.id)) serving.add(row.backend);
+    return config.backends.filter((backend) => serving.has(backend));
   }
 
   return {
@@ -350,20 +381,190 @@ export function createRegistry(config, { fetchImpl = fetch, env = process.env, n
       }
       return data;
     },
+    candidates,
     async resolve(model) {
-      const fromConfig = resolveStatic(model);
-      if (fromConfig) return fromConfig;
-      const index = new Map();
-      for (const row of await table()) if (!index.has(row.id)) index.set(row.id, row.backend);
-      for (const candidate of lookupCandidates(model)) {
-        const backend = index.get(candidate);
-        if (backend) return backend;
-      }
-      return null;
+      return (await candidates(model))[0] ?? null;
     },
     async knownIds() {
       return (await this.list()).map((entry) => entry.id);
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Account routing
+// ---------------------------------------------------------------------------
+
+// A 5xx answer whose body says the account ran out. The adapters answer 429
+// `usage_limit_reached`; older ones still wrap the CLI's text in a 500/502.
+// The same pattern the adapters use. A bare "limit reached" is not enough:
+// "Context limit reached" means the prompt is too big, and failing that over
+// would rest every account for nothing.
+export const QUOTA_PATTERN = /usage.?limit|rate.?limit|(?:hit|reached) your [^\n.]{0,40}?\blimit\b|\b(?!(?:context|tokens?|output|input|length|size|max)\b)[\w-]+ limit reached|rate_limit_error|usage_limit_reached|\b429\b/i;
+const QUOTA_BODY_CAP = 64 * 1024;
+const LIMIT_REASON_MAX = 200;
+const TRY_AGAIN = /try again in\s*~?\s*(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/i;
+const RESET_EPOCH = /\|(\d{9,11})(?!\d)/;
+const UNIT_MS = { h: 60 * 60 * 1000, m: 60 * 1000, s: 1000 };
+
+// A connection that never produced a response: the backend is down or gone,
+// so the request cannot have run there and another account may take it.
+const UNREACHABLE_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
+
+function retryAfterMs(value) {
+  const text = Array.isArray(value) ? value[0] : value;
+  if (typeof text !== 'string' || !/^\s*\d+\s*$/.test(text)) return null;
+  const seconds = Number(text);
+  return seconds > 0 ? seconds * 1000 : null;
+}
+
+function bodyCooldownMs(text, at) {
+  const wait = TRY_AGAIN.exec(text);
+  if (wait) {
+    const ms = Number(wait[1]) * UNIT_MS[wait[2][0].toLowerCase()];
+    if (ms > 0) return ms;
+  }
+  const epoch = RESET_EPOCH.exec(text);
+  if (epoch) {
+    const ms = Number(epoch[1]) * 1000 - at;
+    if (ms > 0) return ms;
+  }
+  return null;
+}
+
+function limitReason(text, status) {
+  let message = '';
+  try {
+    const payload = JSON.parse(text);
+    const error = payload?.error;
+    if (typeof error === 'string') message = error;
+    else if (typeof error?.message === 'string') message = error.message;
+    else if (typeof payload?.message === 'string') message = payload.message;
+  } catch {
+    // Not JSON: the text itself is the reason.
+  }
+  if (!message) message = text;
+  // Redact the whole text before truncating, so a cut can't expose half a token.
+  const clean = redact(message).replace(/\s+/g, ' ').trim();
+  return (clean ? `HTTP ${status}: ${clean}` : `HTTP ${status}`).slice(0, LIMIT_REASON_MAX);
+}
+
+const isoOrNull = (ms) => (ms == null ? null : new Date(ms).toISOString());
+
+// In-memory only: a router restart forgets every cooldown and counter.
+export function createRoutingState(config, { now = () => Date.now() } = {}) {
+  const routing = config.routing;
+  const states = new Map();
+
+  function stateOf(backend) {
+    let state = states.get(backend.name);
+    if (!state) {
+      // cooldownKind: 'quota' | 'unreachable' | null - why cooldownUntil was set.
+      state = { cooldownUntil: 0, cooldownKind: null, consecutiveLimits: 0, starts: [], lastUsedAt: null, lastLimitReason: null };
+      states.set(backend.name, state);
+    }
+    return state;
+  }
+
+  function requestsInWindow(state, at) {
+    const cutoff = at - routing.windowMs;
+    const keep = state.starts.findIndex((start) => start > cutoff);
+    state.starts.splice(0, keep === -1 ? state.starts.length : keep);
+    return state.starts.length;
+  }
+
+  return {
+    mode: routing.mode,
+
+    // The next backend to try, or null. `candidates` is already in config order.
+    pick(candidates, tried = new Set()) {
+      const at = now();
+      const untried = candidates.filter((backend) => !tried.has(backend));
+      const open = untried.filter((backend) => stateOf(backend).cooldownUntil <= at);
+      if (open.length === 0) {
+        // Everything is cooling. A backend cooling only because it was
+        // unreachable is still worth a try - a refused connection costs
+        // nothing, and a single-backend config keeps answering a fresh 502
+        // instead of a 429. Earliest release first. Only when every candidate
+        // is cooling for quota does the caller answer all_accounts_limited.
+        const unreachable = untried.filter((backend) => stateOf(backend).cooldownKind === 'unreachable');
+        unreachable.sort((a, b) => stateOf(a).cooldownUntil - stateOf(b).cooldownUntil);
+        return unreachable[0] ?? null;
+      }
+      if (routing.mode === 'balance') {
+        const load = new Map(open.map((backend) => [backend, requestsInWindow(stateOf(backend), at)]));
+        // Never used sorts first; equal times fall through to config order,
+        // which the stable sort keeps.
+        const lastUsed = (backend) => stateOf(backend).lastUsedAt ?? -Infinity;
+        const byLastUsed = (a, b) => (lastUsed(a) < lastUsed(b) ? -1 : lastUsed(a) > lastUsed(b) ? 1 : 0);
+        open.sort((a, b) => (load.get(a) - load.get(b)) || byLastUsed(a, b));
+      }
+      return open[0];
+    },
+
+    attempted(backend) {
+      const state = stateOf(backend);
+      const at = now();
+      requestsInWindow(state, at);
+      state.starts.push(at);
+      state.lastUsedAt = at;
+    },
+
+    // The backend answered and the answer is being relayed. It is reachable, so
+    // an unreachable cooldown no longer holds; only a 2xx resets the limit count.
+    answered(backend, status) {
+      const state = stateOf(backend);
+      if (state.cooldownKind === 'unreachable') {
+        state.cooldownUntil = 0;
+        state.cooldownKind = null;
+      }
+      if (status >= 200 && status < 300) state.consecutiveLimits = 0;
+    },
+
+    // Returns the cooldown end. Every source is capped at maxCooldownMs: a
+    // multi-day hint or a garbled epoch would otherwise park the account until
+    // restart, and the cap costs one fast 429 per maxCooldownMs at worst.
+    limited(backend, { status, headers, text }) {
+      const state = stateOf(backend);
+      const at = now();
+      const ms = retryAfterMs(headers?.['retry-after'])
+        ?? bodyCooldownMs(text, at)
+        ?? routing.defaultCooldownMs * 2 ** state.consecutiveLimits;
+      state.cooldownUntil = at + Math.min(ms, routing.maxCooldownMs);
+      state.cooldownKind = 'quota';
+      state.consecutiveLimits += 1;
+      state.lastLimitReason = limitReason(text, status);
+      return state.cooldownUntil;
+    },
+
+    unreachable(backend, error) {
+      const state = stateOf(backend);
+      state.cooldownUntil = now() + routing.unreachableCooldownMs;
+      state.cooldownKind = 'unreachable';
+      state.lastLimitReason = redact(`unreachable: ${error?.code || error?.message || error}`).slice(0, LIMIT_REASON_MAX);
+      return state.cooldownUntil;
+    },
+
+    // Earliest moment any of `candidates` leaves its cooldown.
+    earliestRelease(candidates) {
+      const at = now();
+      const ends = candidates.map((backend) => stateOf(backend).cooldownUntil).filter((until) => until > at);
+      return ends.length ? Math.min(...ends) : at;
+    },
+
+    snapshot(backend) {
+      const state = stateOf(backend);
+      const at = now();
+      return {
+        cooldown_until: state.cooldownUntil > at ? isoOrNull(state.cooldownUntil) : null,
+        consecutive_limits: state.consecutiveLimits,
+        requests_in_window: requestsInWindow(state, at),
+        last_used_at: isoOrNull(state.lastUsedAt),
+        last_limit_reason: state.lastLimitReason,
+      };
+    },
+
+    now,
   };
 }
 
@@ -405,73 +606,164 @@ function upstreamHeaders(clientHeaders, body, backend, env) {
   return headers;
 }
 
-// Byte-for-byte relay. The body goes out as it arrived and the response is
-// piped, so SSE framing (including a backend that buffers and then flushes)
-// survives untouched.
-function forward({ req, res, backend, upstreamPath, body, config, env }) {
+function unreachableError(error) {
+  // Keyed on the socket error code only. The inactivity timeout arrives here as
+  // an error too (statusCode 504) and must stay a 504: like a generic 5xx, the
+  // backend may have been working on the request, so it is not repeated.
+  return !error?.statusCode && UNREACHABLE_CODES.has(error?.code);
+}
+
+// One upstream attempt. Resolves with what happened:
+//   { kind: 'relayed', status, upstreamStatus } - the answer went (or is going)
+//     to the client; nothing more may be tried for this request
+//   { kind: 'failed', status } - an error was reported to the client
+//   { kind: 'quota', status, headers, text } - account exhausted; the client
+//     has been sent nothing
+//   { kind: 'unreachable', error } - no connection; the client has been sent nothing
+//
+// A 2xx, and any status that cannot be a usage limit, is a byte-for-byte
+// relay: the body goes out as it arrived and the response is piped, so SSE
+// framing (including a backend that buffers and then flushes) survives
+// untouched. A 429 or a 5xx is held back (up to 64 KB) only long enough to
+// tell a usage limit from an ordinary error, and an ordinary error is then
+// relayed with the same bytes.
+function attempt({ req, res, backend, upstreamPath, body, config, env, onAbort, onRelay }) {
   return new Promise((resolve) => {
     const target = new URL(`${backend.baseUrl}${upstreamPath}`);
     const transport = target.protocol === 'https:' ? https : http;
     let settled = false;
-    const finish = (status) => {
+    let upstream = null;
+    const finish = (outcome) => {
       if (!settled) {
         settled = true;
-        resolve(status);
+        onAbort(null);
+        resolve(outcome);
       }
     };
-
-    const upstream = transport.request({
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port || (target.protocol === 'https:' ? 443 : 80),
-      path: `${target.pathname}${target.search}`,
-      method: req.method,
-      headers: upstreamHeaders(req.headers, body, backend, env),
-    });
 
     // A client that hangs up must take the upstream request with it: these
     // backends spawn CLI processes that would otherwise run on for minutes.
-    const onClientClose = () => {
-      if (!res.writableFinished) {
-        upstream.destroy();
-        finish(499);
-      }
-    };
-    res.on('close', onClientClose);
-
-    upstream.setTimeout(config.upstreamTimeoutMs, () => {
-      upstream.destroy(httpError(504, `backend ${backend.name} sent nothing for ${config.upstreamTimeoutMs} ms`));
+    onAbort(() => {
+      upstream?.destroy();
+      finish({ kind: 'relayed', status: 499 });
     });
 
-    upstream.on('error', (error) => {
-      const status = Number(error?.statusCode) || 502;
-      if (res.headersSent || res.writableEnded) {
-        res.destroy();
-        finish(status);
-        return;
-      }
-      sendError(res, status, `backend ${backend.name} request failed: ${error?.message || error}`, { type: 'api_error', code: status === 504 ? 'upstream_timeout' : 'upstream_unavailable' });
-      finish(status);
-    });
-
-    upstream.on('response', (upstreamRes) => {
-      const headers = {};
-      for (const name of PASSED_RESPONSE_HEADERS) {
-        if (upstreamRes.headers[name]) headers[name] = upstreamRes.headers[name];
-      }
-      const status = upstreamRes.statusCode || 502;
-      res.writeHead(status, headers);
-      res.socket?.setNoDelay(true);
-      upstreamRes.socket?.setNoDelay(true);
-      upstreamRes.on('error', () => {
-        res.destroy();
-        finish(status);
+    // `fresh` forces a new connection (no agent pool) for the stale-socket retry.
+    const send = (fresh) => {
+      let responded = false;
+      const request = transport.request({
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        path: `${target.pathname}${target.search}`,
+        method: req.method,
+        headers: upstreamHeaders(req.headers, body, backend, env),
+        ...(fresh ? { agent: false } : {}),
       });
-      res.on('finish', () => finish(status));
-      upstreamRes.pipe(res);
-    });
+      upstream = request;
+      // Events from a request this attempt has moved past (settled, or
+      // replaced by the retry) are ignored, so an abandoned upstream can never
+      // write to or destroy a response that something else now owns.
+      const stale = () => settled || upstream !== request;
 
-    upstream.end(body);
+      request.setTimeout(config.upstreamTimeoutMs, () => {
+        if (stale()) return;
+        request.destroy(httpError(504, `backend ${backend.name} sent nothing for ${config.upstreamTimeoutMs} ms`));
+      });
+
+      const fail = (error) => {
+        if (stale()) return;
+        const status = Number(error?.statusCode) || 502;
+        if (res.headersSent || res.writableEnded) {
+          res.destroy();
+          finish({ kind: 'relayed', status });
+          return;
+        }
+        // A keep-alive socket the backend closed while it sat in the pool
+        // resets on reuse before the request reaches the backend. That says
+        // nothing about the backend, so try it once more on a new connection.
+        if (!responded && !fresh && request.reusedSocket && error?.code === 'ECONNRESET') {
+          send(true);
+          return;
+        }
+        if (!responded && unreachableError(error)) {
+          finish({ kind: 'unreachable', error });
+          return;
+        }
+        sendError(res, status, `backend ${backend.name} request failed: ${error?.message || error}`, { type: 'api_error', code: status === 504 ? 'upstream_timeout' : 'upstream_unavailable' });
+        finish({ kind: 'failed', status });
+      };
+      request.on('error', fail);
+
+      request.on('response', (upstreamRes) => {
+        responded = true;
+        const status = upstreamRes.statusCode || 502;
+        upstreamRes.on('error', (error) => {
+          if (stale() || !res.headersSent) {
+            fail(error);
+            return;
+          }
+          res.destroy();
+          finish({ kind: 'relayed', status, upstreamStatus: status });
+        });
+
+        const relay = (prefix, complete) => {
+          const headers = {};
+          for (const name of PASSED_RESPONSE_HEADERS) {
+            if (upstreamRes.headers[name]) headers[name] = upstreamRes.headers[name];
+          }
+          onRelay(status);
+          res.writeHead(status, headers);
+          res.socket?.setNoDelay(true);
+          upstreamRes.socket?.setNoDelay(true);
+          res.on('finish', () => finish({ kind: 'relayed', status, upstreamStatus: status }));
+          for (const chunk of prefix) res.write(chunk);
+          if (complete) res.end();
+          else upstreamRes.pipe(res);
+        };
+
+        // Only a usage limit fails over: a 429 always, a 5xx when its text says
+        // so (older adapters wrap the CLI's limit message in a 500/502). A
+        // generic 5xx is relayed as it is: it may be this request's own fault,
+        // and repeating it on every account would burn all of them for
+        // nothing. Any other 4xx is about the request itself, whatever its
+        // text says, and is relayed without being inspected.
+        if (status !== 429 && status < 500) {
+          relay([], false);
+          return;
+        }
+
+        const chunks = [];
+        let size = 0;
+        const decide = (complete) => {
+          if (stale()) return;
+          const text = Buffer.concat(chunks).subarray(0, QUOTA_BODY_CAP).toString('utf8');
+          if (status === 429 || QUOTA_PATTERN.test(text)) {
+            finish({ kind: 'quota', status, headers: upstreamRes.headers, text });
+            if (!complete) upstreamRes.destroy();
+            return;
+          }
+          relay(chunks, complete);
+        };
+        const onData = (chunk) => {
+          chunks.push(chunk);
+          size += chunk.length;
+          if (size >= QUOTA_BODY_CAP) {
+            upstreamRes.pause();
+            upstreamRes.off('data', onData);
+            upstreamRes.off('end', onEnd);
+            decide(false);
+          }
+        };
+        const onEnd = () => decide(true);
+        upstreamRes.on('data', onData);
+        upstreamRes.on('end', onEnd);
+      });
+
+      request.end(body);
+    };
+
+    send(false);
   });
 }
 
@@ -497,6 +789,7 @@ export function createHandler({
   fetchImpl = fetch,
   log = defaultLog,
   registry: injectedRegistry,
+  now = () => Date.now(),
 } = {}) {
   const config = normalizeConfig(rawConfig ?? {}, env);
   const secret = sharedSecret !== undefined ? sharedSecret : (env[config.clientAuthEnv] || '');
@@ -510,7 +803,8 @@ export function createHandler({
       // A broken stdout must never turn into a failed request.
     }
   };
-  const registry = injectedRegistry || createRegistry(config, { fetchImpl, env, log: safeLog });
+  const registry = injectedRegistry || createRegistry(config, { fetchImpl, env, now, log: safeLog });
+  const routing = createRoutingState(config, { now });
 
   async function probe(backend) {
     const startedAt = Date.now();
@@ -534,20 +828,94 @@ export function createHandler({
       throw httpError(400, 'Request body must include a "model" string; the router has no default model', { param: 'model', code: 'model_required' });
     }
     record.model = requested;
-    const backend = await registry.resolve(requested);
-    if (!backend) {
+    const candidates = registry.candidates
+      ? await registry.candidates(requested)
+      : [await registry.resolve(requested)].filter(Boolean);
+    if (candidates.length === 0) {
       const ids = await registry.knownIds();
       throw httpError(404, `Unknown model "${requested}". Available models: ${ids.join(', ') || '(none; every backend is unreachable)'}`, { param: 'model', code: 'model_not_found' });
     }
-    record.backend = backend.name;
-    const body = kind === 'embeddings' ? rewriteEmbeddingsBody(raw, parsed, backend) : raw;
-    return forward({ req, res, backend, upstreamPath, body, config, env });
+
+    // One close listener for the whole request, aimed at whichever upstream
+    // attempt is in flight. `close` also fires after a normal finish.
+    let abortInflight = null;
+    let clientGone = false;
+    const onClientClose = () => {
+      if (res.writableFinished) return;
+      clientGone = true;
+      abortInflight?.();
+    };
+    res.on('close', onClientClose);
+
+    try {
+      const tried = new Set();
+      let lastUnreachable = null;
+      for (let backend = routing.pick(candidates, tried); backend; backend = routing.pick(candidates, tried)) {
+        if (clientGone || res.destroyed) return 499;
+        tried.add(backend);
+        record.backend = backend.name;
+        record.attempts += 1;
+        routing.attempted(backend);
+        // The same bytes on every attempt: the hook is an identity today.
+        const body = kind === 'embeddings' ? rewriteEmbeddingsBody(raw, parsed, backend) : raw;
+        const outcome = await attempt({
+          req,
+          res,
+          backend,
+          upstreamPath,
+          body,
+          config,
+          env,
+          onAbort: (abort) => { abortInflight = abort; },
+          onRelay: (status) => routing.answered(backend, status),
+        });
+        if (outcome.kind === 'relayed' || outcome.kind === 'failed') return outcome.status;
+        if (clientGone) return 499;
+
+        const until = outcome.kind === 'quota'
+          ? routing.limited(backend, outcome)
+          : routing.unreachable(backend, outcome.error);
+        if (outcome.kind === 'unreachable') lastUnreachable = { error: outcome.error, backend };
+        // No upstream text here: the reason is on /health, redacted.
+        safeLog({
+          event: 'failover',
+          at: new Date().toISOString(),
+          model: record.model,
+          from: backend.name,
+          to: routing.pick(candidates, tried)?.name ?? null,
+          reason: outcome.kind,
+          cooldown_until: new Date(until).toISOString(),
+        });
+      }
+
+      // pick() only runs dry once every untried candidate is cooling for quota,
+      // so a candidate left cooling for `unreachable` was tried and refused in
+      // this request: that is a 502 as it always was. all_accounts_limited is
+      // for the case where every candidate is out of quota.
+      if (lastUnreachable) {
+        sendError(res, 502, `backend ${lastUnreachable.backend.name} request failed: ${lastUnreachable.error?.message || lastUnreachable.error}`, { type: 'api_error', code: 'upstream_unavailable' });
+        return 502;
+      }
+      const release = routing.earliestRelease(candidates);
+      const retryAfter = Math.max(1, Math.ceil((release - now()) / 1000));
+      sendError(
+        res,
+        429,
+        `All accounts for model ${requested} are limited until ${new Date(release).toISOString()}`,
+        { type: 'usage_limit_reached', code: 'all_accounts_limited' },
+        { 'retry-after': String(retryAfter) },
+      );
+      return 429;
+    } finally {
+      res.off('close', onClientClose);
+    }
   }
 
   return async function handler(req, res) {
     const startedAt = Date.now();
     const pathname = new URL(req.url, 'http://router.invalid').pathname;
-    const record = { model: null, backend: null };
+    const record = { model: null, backend: null, attempts: 0 };
+    // `backend` is the last one tried: the one whose answer ended the request.
     const emit = (status) => safeLog({
       event: 'request',
       at: new Date().toISOString(),
@@ -556,17 +924,19 @@ export function createHandler({
       backend: record.backend,
       model: record.model,
       status,
+      attempts: record.attempts,
       duration_ms: Date.now() - startedAt,
     });
 
     try {
       if (req.method === 'GET' && pathname === '/health') {
-        const backends = await Promise.all(config.backends.map(probe));
+        const probes = await Promise.all(config.backends.map(probe));
         return sendJson(res, 200, {
           status: 'ok',
           listen: { host: config.host, port: config.port },
           client_auth: Boolean(secret),
-          backends,
+          routing: { mode: config.routing.mode, window_ms: config.routing.windowMs },
+          backends: probes.map((entry, index) => ({ ...entry, routing: routing.snapshot(config.backends[index]) })),
         });
       }
 
@@ -638,6 +1008,7 @@ if (isMain) {
       config: source,
       config_is_example: fallback,
       client_auth: Boolean(process.env[config.clientAuthEnv]),
+      routing: config.routing.mode,
       backends: config.backends.map((backend) => ({
         name: backend.name,
         base_url: backend.baseUrl,

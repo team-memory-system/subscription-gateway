@@ -31,8 +31,9 @@ export function gatewayPaths(env = process.env, platform = process.platform) {
   const home = appHome(env, platform);
   return {
     appHome: home,
-    // One directory per backend, handed to the CLI as its whole config home.
-    authDir: (backend) => path.join(home, "auth", backend),
+    // One directory per account, handed to the CLI as its whole config home.
+    authDir: (backend, accountId) => path.join(home, "auth", backend, accountId),
+    accountsFile: path.join(home, "accounts.json"),
     secretsFile: path.join(home, "secrets.json"),
     routerConfigFile: path.join(home, "router-config.json"),
     runtimeDir: path.join(home, "runtime"),

@@ -21,7 +21,15 @@ const REQUEST_TIMEOUT_MS = Number(process.env.CLAUDE_PROXY_REQUEST_TIMEOUT_MS ||
 const MAX_BODY_BYTES = Number(process.env.CLAUDE_PROXY_MAX_BODY_BYTES || 8 * 1024 * 1024);
 
 const DEFAULT_MODEL = process.env.CLAUDE_PROXY_MODEL || 'claude-opus-5-5';
-const SUPPORTED_MODELS = new Set(['claude-opus-5', 'claude-opus-5-5']);
+// The CLI has no command that lists models, so this list is kept by hand. Each id
+// answered `claude -p --model <id>` on a Max and on a Team login on 2026-09-30.
+// Newest first within a family; `/v1/models` lists them in this order.
+const SUPPORTED_MODELS = new Set([
+  'claude-opus-5-5', 'claude-opus-5',
+  'claude-sonnet-5-5', 'claude-sonnet-5',
+  'claude-fable-5-1', 'claude-fable-5',
+  'claude-haiku-4-5',
+]);
 if (!SUPPORTED_MODELS.has(DEFAULT_MODEL)) {
   throw new Error('CLAUDE_PROXY_MODEL must be a supported canonical model ID');
 }
@@ -102,13 +110,60 @@ function httpError(statusCode, message) {
   return error;
 }
 
-function sendJson(res, statusCode, payload) {
-  res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
+function sendJson(res, statusCode, payload, headers = {}) {
+  res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8', ...headers });
   res.end(`${JSON.stringify(payload)}\n`);
 }
 
 function sendError(res, statusCode, message) {
   sendJson(res, statusCode, { error: { message: String(message), type: 'claude_print_proxy_error' } });
+}
+
+// ---------------------------------------------------------------------------
+// Usage-limit detection
+// ---------------------------------------------------------------------------
+
+// A router in front of this adapter fails over to another account when the
+// answer is 429 with code `usage_limit_reached`. The exact text `claude -p`
+// prints for an exhausted subscription is not pinned down, so detection is
+// tolerant. QUOTA_PATTERN is the pattern shared with the Codex adapter. It
+// covers CLI 2.1.284's own "You've hit your session limit · resets 5pm" family
+// (session, weekly, Opus, Sonnet, usage credit ...) and older "Weekly limit
+// reached" wording, but not a bare "limit reached": "Context limit reached" is a
+// prompt that is too big, and a router would rest every account for it.
+const QUOTA_PATTERN = /usage.?limit|rate.?limit|(?:hit|reached) your [^\n.]{0,40}?\blimit\b|\b(?!(?:context|tokens?|output|input|length|size|max)\b)[\w-]+ limit reached|rate_limit_error|usage_limit_reached|\b429\b/i;
+
+function parseRetryAfterSeconds(text, now) {
+  const epoch = /\|\s*(\d{9,11})(?!\d)/.exec(text);
+  if (epoch) return Math.max(0, Number(epoch[1]) - Math.floor(now / 1000));
+  const tryAgain = /try again in\s*~?\s*(\d+)\s*min/i.exec(text);
+  if (tryAgain) return Number(tryAgain[1]) * 60;
+  const resetsIn = /resets? in\s*~?\s*(\d+)\s*(seconds?|secs?|minutes?|mins?)\b/i.exec(text);
+  if (resetsIn) return Number(resetsIn[1]) * (/^s/i.test(resetsIn[2]) ? 1 : 60);
+  return undefined;
+}
+
+export function classifyUpstreamError(message, now = Date.now()) {
+  const text = String(message ?? '');
+  if (!QUOTA_PATTERN.test(text)) return { quota: false };
+  const retryAfterSeconds = parseRetryAfterSeconds(text, now);
+  return retryAfterSeconds === undefined ? { quota: true } : { quota: true, retryAfterSeconds };
+}
+
+function usageLimitError(message, retryAfterSeconds) {
+  const error = httpError(429, message);
+  error.usageLimit = true;
+  if (retryAfterSeconds !== undefined) error.retryAfterSeconds = retryAfterSeconds;
+  return error;
+}
+
+function sendUsageLimit(res, error) {
+  sendJson(
+    res,
+    429,
+    { error: { message: String(error.message), type: 'usage_limit_reached', code: 'usage_limit_reached' } },
+    Number.isInteger(error.retryAfterSeconds) ? { 'retry-after': String(error.retryAfterSeconds) } : {},
+  );
 }
 
 async function readJsonBody(req) {
@@ -756,6 +811,14 @@ export function createSpawnRunner({
         }
         const stderrText = stderrTail.toString('utf8').trim();
         if (code !== 0 || killSignal) {
+          // An exhausted subscription answers 429 with the CLI's own text, so a
+          // router can fail over; every other failed exit stays a 502.
+          const limitText = [stderrText, stdout].find((text) => text && classifyUpstreamError(text).quota);
+          if (limitText) {
+            const { retryAfterSeconds } = classifyUpstreamError(limitText);
+            finish(reject, usageLimitError(limitText.slice(0, STDERR_TAIL_BYTES), retryAfterSeconds));
+            return;
+          }
           finish(reject, httpError(502, `claude exited with code ${code}${killSignal ? ` (signal ${killSignal})` : ''}: ${stderrText || '<no stderr>'}`));
           return;
         }
@@ -904,6 +967,15 @@ export function createHandler({
     }
 
     if (payload?.is_error) {
+      // `claude -p` reports the HTTP status of an API error that ended the turn
+      // as `api_error_status`; the text lives in `result` (or `errors`).
+      const upstreamText = [payload.result, ...(Array.isArray(payload.errors) ? payload.errors : [])]
+        .filter((text) => typeof text === 'string' && text)
+        .join('\n');
+      const verdict = classifyUpstreamError(upstreamText);
+      if (verdict.quota || payload.api_error_status === 429) {
+        throw usageLimitError(upstreamText || 'claude returned an error', verdict.retryAfterSeconds);
+      }
       throw httpError(502, typeof payload.result === 'string' && payload.result
         ? payload.result
         : 'claude returned an error');
@@ -1029,6 +1101,7 @@ export function createHandler({
         res.end();
         return undefined;
       }
+      if (error?.usageLimit) return sendUsageLimit(res, error);
       return sendError(res, statusCode, error?.message || error);
     }
   };

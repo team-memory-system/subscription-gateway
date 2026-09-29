@@ -12,8 +12,12 @@ set PORT=11446 for the managed configuration.
 
 ## Model and request behavior
 
-- Model IDs: `claude-opus-5`, `claude-opus-5-5`. Default: Opus 5.5. Alias `opus`
-  resolves to the configured default. Unknown IDs fail with 400.
+- Model IDs: `claude-opus-5-5`, `claude-opus-5`, `claude-sonnet-5-5`,
+  `claude-sonnet-5`, `claude-fable-5-1`, `claude-fable-5`, `claude-haiku-4-5`.
+  Default: Opus 5.5. Alias `opus` resolves to the configured default. Unknown IDs
+  fail with 400. The CLI has no command that lists models, so the list in
+  `server.mjs` is kept by hand; each id answered on a Max and a Team login on
+  2026-09-30.
 - Legacy WeKnora display suffixes (` [low]`, optionally ` vision`) are accepted;
   the validated canonical ID is passed to `claude --model`.
 - `reasoning_effort`: low, medium, high, xhigh, max. Default low. Model labels
@@ -49,7 +53,17 @@ set PORT=11446 for the managed configuration.
 
 `GET /health` is public. `GET /v1/models` and `POST /v1/chat/completions` use
 the configured Bearer key. Error codes: 400 malformed input, 401 unauthorized,
-413 oversized body, 502 CLI failure, 504 timeout.
+413 oversized body, 429 usage limit, 502 other CLI failure, 504 timeout.
+
+An exhausted subscription answers `429` with
+`{"error":{"message":"<the CLI's text>","type":"usage_limit_reached","code":"usage_limit_reached"}}`,
+plus `retry-after` in seconds when the text says when it resets (`|<epoch>`,
+`Try again in ~N min`, `resets in N minutes`). A router uses that to move to
+another account. CLI 2.1.284 words it as `You've hit your <session|weekly|Opus|Sonnet|usage credit> limit · resets <time>`,
+which has no parseable reset, so no `retry-after`. The JSON result of
+`claude -p` also carries `api_error_status`; `429` there counts too. "Context
+limit reached" is a prompt that is too big and stays a `502`. This mapping is
+built from the CLI's code, not yet seen on a real exhausted account.
 
 Request logs contain model, effort, duration, usage, cost, status and counts;
 prompts, response bodies, images and credentials are excluded. Logs are not

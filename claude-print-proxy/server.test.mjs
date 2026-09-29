@@ -1,11 +1,19 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { buildInvocation, buildRequestLogEntry, createHandler, logRequest } from './server.mjs';
+import {
+  buildInvocation,
+  buildRequestLogEntry,
+  classifyUpstreamError,
+  createHandler,
+  createSpawnRunner,
+  logRequest,
+} from './server.mjs';
 
 // Every image of a request lands in a private directory under the workdir, so
 // pointing the workdir at a scratch directory lets the tests assert that nothing
@@ -1285,10 +1293,199 @@ test('logRequest prints one JSON line to stdout, and CLAUDE_PROXY_REQUEST_LOG=0 
   assert.equal(silenced, null);
 });
 
- test('explicit model selection pins Opus versions and rejects unknown models', () => {
-  for (const model of ['claude-opus-5', 'claude-opus-5-5']) {
+ test('explicit model selection pins each supported version and rejects unknown models', () => {
+  for (const model of [
+    'claude-opus-5-5', 'claude-opus-5',
+    'claude-sonnet-5-5', 'claude-sonnet-5',
+    'claude-fable-5-1', 'claude-fable-5',
+    'claude-haiku-4-5',
+  ]) {
     const { args } = buildInvocation({model: `${model} [low]`, messages: [{role: 'user', content: 'test'}]});
     assert.equal(argValue(args, '--model'), model);
   }
   assert.throws(() => buildInvocation({model: 'unknown-model', messages: [{role: 'user', content: 'test'}]}), /Unsupported model/);
+});
+
+// ---------------------------------------------------------------------------
+// Usage-limit failures: 429 usage_limit_reached for the router, 502 otherwise
+// ---------------------------------------------------------------------------
+
+async function postChatRaw(baseUrl, body) {
+  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, headers: res.headers, text: await res.text() };
+}
+
+function usageLimitBody(message) {
+  return { error: { message, type: 'usage_limit_reached', code: 'usage_limit_reached' } };
+}
+
+function isErrorPayload(result, extra = {}) {
+  return { type: 'result', subtype: 'success', is_error: true, result, usage: {}, ...extra };
+}
+
+// A real child process standing in for `claude`, so the spawn runner's own exit
+// handling is what gets exercised.
+function shellRunner(script) {
+  return createSpawnRunner({
+    claudeBin: 'sh',
+    spawnFn: (_bin, _args, options) => spawn('sh', ['-c', script], options),
+  });
+}
+
+test('classifyUpstreamError recognizes usage-limit text and parses the reset', () => {
+  const now = Date.UTC(2026, 8, 29, 12, 0, 0);
+  const nowSeconds = Math.floor(now / 1000);
+  assert.deepEqual(
+    classifyUpstreamError(`Claude AI usage limit reached|${nowSeconds + 600}`, now),
+    { quota: true, retryAfterSeconds: 600 },
+  );
+  assert.deepEqual(
+    classifyUpstreamError('Claude AI usage limit reached|1759999999', now),
+    { quota: true, retryAfterSeconds: 0 },
+    'an epoch in the past clamps to 0',
+  );
+  assert.deepEqual(
+    classifyUpstreamError('You have hit your usage limit. Try again in ~5 min.', now),
+    { quota: true, retryAfterSeconds: 300 },
+  );
+  assert.deepEqual(classifyUpstreamError('Usage limit reached · resets in 30 minutes', now), { quota: true, retryAfterSeconds: 1800 });
+  assert.deepEqual(classifyUpstreamError('usage limit reached, resets in 5 min', now), { quota: true, retryAfterSeconds: 300 });
+  assert.deepEqual(classifyUpstreamError('rate limit hit, resets in 45 seconds', now), { quota: true, retryAfterSeconds: 45 });
+
+  for (const message of [
+    'usage limit reached',
+    'Claude usage limit reached. Your limit resets at 5pm',
+    'Weekly limit reached',
+    '5-hour limit reached ∙ resets 5pm',
+    'You hit your limit',
+    "You've hit your limit · resets 5pm (Asia/Seoul)",
+    "You've hit your usage limit",
+    "You've hit your session limit · resets 5pm (Asia/Seoul)",
+    "You've hit your weekly limit · resets Oct 3, 9am",
+    "You've hit your Opus limit",
+    "You've hit your usage credit limit",
+    "You've reached your Fable limit.",
+    'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}',
+    'rate_limit_error',
+    'usage_limit_reached',
+    'Request failed with status 429',
+  ]) {
+    assert.deepEqual(classifyUpstreamError(message, now), { quota: true }, message);
+  }
+
+  for (const message of [
+    'Not logged in · Please run /login',
+    'claude exited with code 1: boom',
+    'Credit balance is too low',
+    'Reached maximum number of turns (1)',
+    'prompt has 4290 tokens',
+    'Context limit reached · /compact or /clear to continue',
+    'Output token limit reached',
+    'limit reached',
+    '',
+    undefined,
+  ]) {
+    assert.deepEqual(classifyUpstreamError(message, now), { quota: false }, String(message));
+  }
+});
+
+test('is_error with a usage-limit epoch becomes 429 usage_limit_reached with retry-after', async () => {
+  const message = `Claude AI usage limit reached|${Math.floor(Date.now() / 1000) + 900}`;
+  const runClaude = makeRunner(isErrorPayload(message));
+  await withServer({ runClaude }, async (baseUrl) => {
+    const { status, headers, text } = await postChatRaw(baseUrl, { messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(status, 429);
+    assert.equal(headers.get('content-type'), 'application/json; charset=utf-8');
+    const retryAfter = Number(headers.get('retry-after'));
+    assert.ok(Number.isInteger(retryAfter) && retryAfter >= 895 && retryAfter <= 900, `retry-after ${retryAfter}`);
+    assert.deepEqual(JSON.parse(text), usageLimitBody(message));
+  });
+});
+
+test('is_error with the CLI session-limit text becomes 429 without retry-after', async () => {
+  const message = "You've hit your session limit · resets 5pm (Asia/Seoul)";
+  const runClaude = makeRunner(isErrorPayload(message));
+  await withServer({ runClaude }, async (baseUrl) => {
+    const { status, headers, text } = await postChatRaw(baseUrl, { messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(status, 429);
+    assert.equal(headers.get('retry-after'), null);
+    assert.deepEqual(JSON.parse(text), usageLimitBody(message));
+  });
+});
+
+test('is_error with api_error_status 429 becomes 429 even when the text is generic', async () => {
+  const runClaude = makeRunner(isErrorPayload('API Error: request rejected', { api_error_status: 429 }));
+  await withServer({ runClaude }, async (baseUrl) => {
+    const { status, headers, text } = await postChatRaw(baseUrl, { messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(status, 429);
+    assert.equal(headers.get('retry-after'), null);
+    assert.deepEqual(JSON.parse(text), usageLimitBody('API Error: request rejected'));
+  });
+});
+
+test('is_error with a non-quota message keeps the 502 body unchanged', async () => {
+  const runClaude = makeRunner(isErrorPayload('Not logged in · Please run /login', { api_error_status: 401 }));
+  await withServer({ runClaude }, async (baseUrl) => {
+    const { status, headers, text } = await postChatRaw(baseUrl, { messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(status, 502);
+    assert.equal(headers.get('retry-after'), null);
+    assert.deepEqual(JSON.parse(text), {
+      error: { message: 'Not logged in · Please run /login', type: 'claude_print_proxy_error' },
+    });
+  });
+});
+
+test('stream:true with a usage-limit is_error answers 429 JSON before any SSE byte', async () => {
+  const message = 'Claude AI usage limit reached. Try again in ~12 min.';
+  const runClaude = makeRunner(isErrorPayload(message));
+  await withServer({ runClaude }, async (baseUrl) => {
+    const { status, headers, text } = await postChatRaw(baseUrl, {
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(status, 429);
+    assert.equal(headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.equal(headers.get('retry-after'), '720');
+    assert.ok(!text.includes('data:'));
+    assert.deepEqual(JSON.parse(text), usageLimitBody(message));
+  });
+});
+
+test('a non-zero exit whose stderr mentions a usage limit becomes 429', async () => {
+  const epoch = Math.floor(Date.now() / 1000) + 3600;
+  const runClaude = shellRunner(`echo "Claude AI usage limit reached|${epoch}" >&2; exit 1`);
+  await withServer({ runClaude }, async (baseUrl) => {
+    const { status, headers, text } = await postChatRaw(baseUrl, { messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(status, 429);
+    assert.equal(headers.get('content-type'), 'application/json; charset=utf-8');
+    const retryAfter = Number(headers.get('retry-after'));
+    assert.ok(Number.isInteger(retryAfter) && retryAfter >= 3595 && retryAfter <= 3600, `retry-after ${retryAfter}`);
+    assert.deepEqual(JSON.parse(text), usageLimitBody(`Claude AI usage limit reached|${epoch}`));
+  });
+});
+
+test('a non-zero exit whose plain-text stdout mentions a usage limit becomes 429', async () => {
+  const runClaude = shellRunner(`echo "You've hit your weekly limit · resets Oct 3, 9am"; exit 1`);
+  await withServer({ runClaude }, async (baseUrl) => {
+    const { status, headers, text } = await postChatRaw(baseUrl, { messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(status, 429);
+    assert.equal(headers.get('retry-after'), null);
+    assert.deepEqual(JSON.parse(text), usageLimitBody("You've hit your weekly limit · resets Oct 3, 9am"));
+  });
+});
+
+test('a non-zero exit without a usage limit keeps the 502', async () => {
+  const runClaude = shellRunner('echo "boom" >&2; exit 3');
+  await withServer({ runClaude }, async (baseUrl) => {
+    const { status, headers, text } = await postChatRaw(baseUrl, { messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(status, 502);
+    assert.equal(headers.get('retry-after'), null);
+    assert.deepEqual(JSON.parse(text), {
+      error: { message: 'claude exited with code 3: boom', type: 'claude_print_proxy_error' },
+    });
+  });
 });

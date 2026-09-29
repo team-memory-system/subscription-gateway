@@ -35,8 +35,32 @@ Two things can, and they are separate:
   supervisor detached that keeps all three alive. It needs `llmProxyRoot` in its host
   profile to point at this checkout. It registers nothing with the OS, so nothing
   restarts them after a reboot.
+- `ui/server.mjs` — the gateway's own screen (`npm run ui`). It keeps its own logins
+  and ports under the app directory, starts one adapter per account plus the router,
+  and also registers nothing with the OS.
 
-Do not let both manage the same service at once.
+Do not let two of them manage the same service at once.
+
+### Several accounts per subscription
+
+The screen holds any number of Codex and Claude logins. Each account is written to
+`accounts.json` in the app directory, gets its own CLI config directory
+(`auth/<backend>/<id>/`), and runs its own adapter on a port chosen once, from
+`GATEWAY_ADAPTER_PORT_BASE` (default 11460). The router receives every logged-in
+account as a separate backend, in the file's order, plus a `routing.mode`:
+
+- `drain` — use the first account until it hits its limit, then the next.
+- `balance` — send each request to the account used least in the last five hours.
+
+An adapter reports an exhausted account as `429` with
+`{"error":{"type":"usage_limit_reached",...}}` and, when it knows, `retry-after`.
+The router then rests that account until the reset and sends the same request to
+the next one. Those rests live in the router's memory: every reconnect, mode change
+or reorder restarts the router and forgets them.
+
+Put in only the operator's own accounts. OpenAI's terms say "You may not share your
+account credentials or make your account available to anyone else", and Anthropic's
+consumer terms say the same.
 
 ### Things that will bite you
 
@@ -48,14 +72,31 @@ Do not let both manage the same service at once.
   template; the real one names backends and which env var holds each key.
 - **Only `codex-openai-proxy` has dependencies** (`@mariozechner/pi-ai`). The other
   two run from a bare Node.
+- **The owner's LaunchAgents run these files from this checkout.** An edit to an
+  adapter reaches the live Honcho path (11435, 11446) the next time that
+  LaunchAgent restarts, committed or not.
+- **A failed upstream request is a status code, not an empty stream.** The Codex
+  adapter starts an SSE response only after pi-ai's first event, so a usage limit
+  answers `429` and any other upstream failure `502` before a byte is streamed.
+- **The Codex model list is the login's, not pi-ai's.** `GET /v1/models` on the
+  Codex adapter asks `https://chatgpt.com/backend-api/codex/models` (what the Codex
+  CLI's picker uses) and lists the `visibility: "list"` models, refreshed every 10
+  minutes. pi-ai's built-in catalog was out of date: nine of its ten ids were
+  refused for a ChatGPT login. The backend hides models newer than the
+  `client_version` asked with, so the adapter asks as `9999.0.0`
+  (`CODEX_MODELS_CLIENT_VERSION`).
+- **`codex login status` answers on stderr**, with exit 0 when logged in and exit 1
+  when not. Reading only stdout makes every login look missing.
 
 ### Verify a change
 
 ```sh
-cd codex-openai-proxy && node --test server.test.mjs   # 11
-cd claude-print-proxy && node --test server.test.mjs   # 47
-cd router            && node --test server.test.mjs    # 18
-python3 -m pytest test_proxyctl.py -q                  # 2
+npm test                                               # all of the below
+cd codex-openai-proxy && node --test server.test.mjs   # 23
+cd claude-print-proxy && node --test server.test.mjs   # 56
+cd router            && node --test server.test.mjs    # 42
+cd ui                && node --test server.test.mjs    # 12
+python3 -m unittest test_proxyctl.py                   # 3
 ```
 
 ### Licence
@@ -110,9 +151,10 @@ LaunchAgent environment, then run `proxyctl.py install` to reload it.
 - Honcho packaging no longer bundles these sources or owns these services by
   default. Supply the independently configured endpoint and existing client key.
 
-Claude accepts `claude-opus-5` and `claude-opus-5-5` explicitly. An omitted model
-or `opus` selects the default, `claude-opus-5-5`; `CLAUDE_PROXY_MODEL` overrides
-that default. `GET /v1/models` returns the supported IDs. Effort remains a
+Claude accepts Opus 5.5 and 5, Sonnet 5.5 and 5, Fable 5.1 and 5, and Haiku 4.5
+by id (`claude-print-proxy/README.md` lists them). An omitted model or `opus`
+selects the default, `claude-opus-5-5`; `CLAUDE_PROXY_MODEL` overrides that
+default. `GET /v1/models` returns the supported IDs. Effort remains a
 separate `reasoning_effort` parameter (default low).
 
 ## Authentication boundary

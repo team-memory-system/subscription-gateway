@@ -2,6 +2,13 @@
   "listen": { "host": "127.0.0.1", "port": 11400 },
   "upstreamTimeoutMs": 900000,
   "modelsTtlMs": 30000,
+  "routing": {
+    "mode": "drain",
+    "windowMs": 18000000,
+    "defaultCooldownMs": 900000,
+    "maxCooldownMs": 21600000,
+    "unreachableCooldownMs": 30000
+  },
   "backends": [
     {
       "name": "codex",

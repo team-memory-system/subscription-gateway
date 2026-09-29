@@ -6,7 +6,7 @@ unchanged. Nothing about a request is interpreted beyond reading `model`.
 
 | Backend | Default base URL | Models |
 |---|---|---|
-| codex | `http://127.0.0.1:11435/v1` | from config (it has no `/v1/models`) |
+| codex | `http://127.0.0.1:11435/v1` | from config, plus `/v1/models` discovery (the login's own list) |
 | claude | `http://127.0.0.1:11446/v1` | from config, plus `/v1/models` discovery |
 | ollama | `http://127.0.0.1:11434/v1` | `/v1/models` discovery (embeddings and local chat) |
 
@@ -14,10 +14,10 @@ unchanged. Nothing about a request is interpreted beyond reading `model`.
 
 | Method | Path | Behavior |
 |---|---|---|
-| GET | `/health` | Router status plus one entry per backend (reachability, HTTP status, latency). Public, always `status: "ok"` if the router itself is up, and never waits longer than `probeTimeoutMs` on a dead backend. |
+| GET | `/health` | Router status plus one entry per backend (reachability, HTTP status, latency, and its `routing` state below). Public, always `status: "ok"` if the router itself is up, and never waits longer than `probeTimeoutMs` on a dead backend. |
 | GET | `/v1/models` | Merged `{object:"list", data:[{id, object, owned_by}]}`. `owned_by` is the backend name. Cached for `modelsTtlMs`. A backend that is down keeps its last good list and otherwise contributes nothing; it never fails the listing. |
-| POST | `/v1/chat/completions` | Dispatch by `model`, forward, relay the response. |
-| POST | `/v1/embeddings` | Same dispatch. |
+| POST | `/v1/chat/completions` | Dispatch by `model` to one of the backends serving it, forward, relay the response; on a usage limit, fail over to the next. |
+| POST | `/v1/embeddings` | Same dispatch and the same failover. An embedding request has no side effect, so sending it to another backend is safe. |
 
 An unknown model is a `404` with an OpenAI-shaped body naming the model and
 listing the available ids; a request with no `model` is a `400`. Upstream status
@@ -28,6 +28,57 @@ an error shape (codex answers `{"error": "text"}`, claude
 Model ids are matched exactly first, then with a legacy WeKnora display suffix
 stripped (`claude-opus-5-5 [low] vision`), then with ollama's `:latest` tag
 added or removed. Only the lookup key is rewritten; the body is not.
+
+## Accounts and failover
+
+Several backends may serve the same model: one subscription with several
+accounts is written as several backends (`codex-1`, `codex-2`, each with its own
+`baseUrl`). Config order is priority order. `routing.mode` decides which one a
+request goes to:
+
+- `drain` (default) — the first account in config order that is not resting.
+- `balance` — the account with the fewest requests in the last `windowMs`; a tie
+  goes to the one used least recently (never used first), then to config order.
+
+A request that meets a usage limit is sent, as the same bytes, to the next
+account. What counts:
+
+| Upstream answer | What the router does |
+|---|---|
+| `429` | Usage limit. Rest the account and try the next one. |
+| `5xx` whose body (first 64 KB) matches `QUOTA_PATTERN` — "usage limit", "rate limit", "hit/reached your … limit", "<word> limit reached" except context/token/output/input/length/size/max, `rate_limit_error`, `usage_limit_reached`, `429` | Usage limit, from an adapter that predates the `429` contract. Same as above. The pattern is the adapters' own; "Context limit reached" (a prompt that is too big) does not match. |
+| Connection error before any response (`ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, `EHOSTUNREACH`, `ENETUNREACH`, `EAI_AGAIN`) | Unreachable. Rest it `unreachableCooldownMs` and try the next. An `ECONNRESET` on a reused keep-alive socket is first retried once, on a new connection to the same account; that retry is not counted as an attempt. |
+| Any other `4xx`, any other `5xx`, a timeout | Relayed as it arrived, and a `4xx` body is not even read. Never retried: a failure may be the request's own fault, and repeating it on every account would burn all of them. |
+
+Nothing fails over once a header or a byte has reached the client, so a `2xx`
+stream is relayed exactly as before. A `2xx` also clears the account's run of
+consecutive limits.
+
+How long an account rests after a usage limit, first match wins, all capped at
+`maxCooldownMs`: the `retry-after` header in seconds; `Try again in ~N min`
+(or `h`, `s`) in the body; `|<epoch seconds>` in the body; otherwise
+`defaultCooldownMs × 2^(consecutive limits)`.
+
+When every account for the model is resting after a usage limit, the answer is
+`429` with `retry-after` set to the earliest release:
+
+```json
+{"error":{"message":"All accounts for model <m> are limited until <ISO>","type":"usage_limit_reached","param":null,"code":"all_accounts_limited"}}
+```
+
+An account resting only because it was unreachable is still tried in that case,
+earliest release first, so a single-backend config answers a dead backend with a
+fresh `502` each time, as it always did. Any answer at all from such an account
+ends its rest.
+
+This state lives in the router's memory. Restarting the router forgets every
+rest and every count. `/health` shows it per backend:
+`routing: {cooldown_until, consecutive_limits, requests_in_window, last_used_at, last_limit_reason}`,
+plus a top-level `routing: {mode, window_ms}`.
+
+A request for a statically listed model now waits on model discovery when some
+backend has `discoverModels`, because every serving backend has to be known.
+Discovery is cached for `modelsTtlMs` and bounded by `discoverTimeoutMs`.
 
 ## Run
 
@@ -90,6 +141,11 @@ routable.
 | `modelsTtlMs` | `ROUTER_MODELS_TTL_MS` | `30000` | Model list cache |
 | `maxBodyBytes` | `ROUTER_MAX_BODY_BYTES` | `8388608` | Request size limit |
 | `clientAuthEnv` | — | `ROUTER_PROXY_SHARED_SECRET` | Name of the env var holding the client token |
+| `routing.mode` | `ROUTER_ROUTING_MODE` | `drain` | `drain` or `balance`; anything else stops startup |
+| `routing.windowMs` | — | `18000000` (5 h) | Window `balance` counts requests in |
+| `routing.defaultCooldownMs` | — | `900000` (15 min) | Rest after a usage limit with no reset hint; doubles per consecutive limit |
+| `routing.maxCooldownMs` | — | `21600000` (6 h) | Cap on any rest |
+| `routing.unreachableCooldownMs` | — | `30000` | Rest after a connection error |
 | — | `ROUTER_CONFIG` | `./config.json` | Config file path |
 | — | `ROUTER_REQUEST_LOG` | `1` | `0` silences the request log |
 
@@ -111,16 +167,20 @@ only ever receives the key named by its `apiKeyEnv`. Every other request header
 - **No SSE re-assembly.** `stream: true` responses are piped through as bytes
   with `Content-Type` and framing preserved. Events are never parsed and
   re-emitted (one backend buffers and then flushes; re-emitting corrupts it).
-- **No retries, fallbacks, load balancing, budgets, quotas or rate limiting.**
-  One model maps to one backend. A failure is reported, not retried.
+- **No retries except account failover.** A usage limit or a connection error
+  moves the request to the next account serving the model (see above). Any other
+  failure is reported, not retried. No budgets and no rate limiting of its own.
 - **No instruction rewriting.** `rewriteEmbeddingsBody()` in `server.mjs` is the
   single marked hook point where a future retrieval-instruction prefix would be
   applied. It returns the request bytes unchanged.
 - **No request or response logging to disk.** One structured line per request on
-  stdout (`method`, `path`, `backend`, `model`, `status`, `duration_ms`) and
-  nothing else: no headers, no bodies, no tokens. Free-form strings are redacted
-  before they are logged or returned.
+  stdout (`method`, `path`, `backend`, `model`, `status`, `attempts`,
+  `duration_ms`), and one `failover` line (`from`, `to`, `reason`,
+  `cooldown_until`) each time an account is skipped. No headers, no bodies, no
+  tokens, no upstream text. Free-form strings are redacted before they are logged
+  or returned.
 - **No login, credential management or key issuing.** Each backend keeps its own
   authentication exactly as it is today.
-- **No web UI, no dashboard, no usage accounting, no caching of completions.**
+- **No web UI, no dashboard, no caching of completions.** The only usage it keeps
+  is the in-memory request count per backend that `balance` needs.
 - **No default model.** A request without `model` is an error, not a guess.

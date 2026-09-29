@@ -46,39 +46,146 @@ function button(text, className, handler) {
   return node;
 }
 
-const BACKEND_LABEL = { codex: "Codex", claude: "Claude" };
+const MODE_TEXT = {
+  drain: { title: "다 쓰고 넘기기", detail: "위 계정부터 한도까지 쓰고, 한도에 걸리면 다음 계정으로 넘어갑니다." },
+  balance: { title: "골고루 쓰기", detail: "최근 5시간 동안 가장 덜 쓴 계정부터 씁니다. 한도에 걸린 계정은 풀릴 때까지 뺍니다." },
+};
 
-function loginRow(entry) {
-  const row = el("div", "row");
-  row.append(el("div", "name", entry.label));
-  row.append(el("span", `badge ${entry.loggedIn ? "on" : "off"}`, entry.loggedIn ? "로그인됨" : "로그인 안 됨"));
+function accountName(account, backends) {
+  const backend = backends.find(entry => entry.name === account.backend);
+  return `${backend ? backend.label : account.backend} ${account.id.split("-").pop()}`;
+}
+
+function clock(iso) {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+}
+
+/** What the router last said about this account, in words. */
+function routingText(routing) {
+  if (!routing) return "";
   const parts = [];
-  if (entry.method) parts.push(entry.method);
-  if (entry.plan) parts.push(entry.plan);
-  if (entry.account) parts.push(entry.account);
-  if (!entry.cliAvailable) parts.push(entry.error || `${entry.backend} 명령을 찾을 수 없습니다`);
-  else if (entry.error) parts.push(entry.error);
+  if (routing.cooldown_until && new Date(routing.cooldown_until).getTime() > Date.now()) {
+    parts.push(`한도에 걸림 · ${clock(routing.cooldown_until)}에 다시 씀`);
+  }
+  if (Number.isFinite(routing.requests_in_window)) parts.push(`최근 5시간 ${routing.requests_in_window}회`);
+  return parts.join("  ·  ");
+}
+
+function renderModes(report) {
+  const target = document.getElementById("modes");
+  target.textContent = "";
+  for (const mode of report.modes) {
+    const text = MODE_TEXT[mode] || { title: mode, detail: "" };
+    const option = el("button", "mode");
+    option.type = "button";
+    option.setAttribute("role", "radio");
+    option.setAttribute("aria-checked", String(report.mode === mode));
+    option.append(el("strong", "", text.title), el("span", "", text.detail));
+    option.addEventListener("click", async () => {
+      if (report.mode === mode) return;
+      const result = await call("/api/mode", { mode });
+      if (!result.ok) return say(result.error || "방식을 바꾸지 못했습니다");
+      // The router reads the mode once, at start; restarting it is what applies it.
+      if (report.ready) await connectNow({ quiet: true });
+      else await refresh();
+    });
+    target.append(option);
+  }
+}
+
+function accountRow(account, siblings, report) {
+  const row = el("div", "row");
+  const login = account.login || {};
+  row.append(el("div", "name", accountName(account, report.backends)));
+  row.append(el("span", `badge ${login.loggedIn ? "on" : "off"}`, login.loggedIn ? "로그인됨" : "로그인 안 됨"));
+  const cooling = account.routing && account.routing.cooldown_until
+    && new Date(account.routing.cooldown_until).getTime() > Date.now();
+  if (login.loggedIn && account.service) {
+    if (cooling) row.append(el("span", "badge wait", "쉬는 중"));
+    else row.append(el("span", `badge ${account.service.running ? "on" : "off"}`, account.service.running ? "쓰는 중" : "안 뜸"));
+  }
+
+  const parts = [];
+  if (login.account) parts.push(login.account);
+  if (login.plan) parts.push(login.plan);
+  const duplicate = login.account && siblings.some(other =>
+    other.id !== account.id && other.login && other.login.account === login.account);
+  if (duplicate) parts.push("같은 계정이 두 번 들어가 있습니다");
+  if (!login.cliAvailable) parts.push(login.error || `${account.backend} 명령을 찾을 수 없습니다`);
+  else if (login.error) parts.push(login.error);
+  const routing = routingText(account.routing);
+  if (routing) parts.push(routing);
   row.append(el("div", "detail", parts.join("  ·  ")));
 
   const buttons = el("div", "buttons");
-  if (entry.loggedIn) {
+  if (login.loggedIn) {
     buttons.append(button("로그아웃", "", async () => {
-      const result = await call("/api/logout", { backend: entry.backend });
+      const result = await call("/api/logout", { account: account.id });
       if (!result.ok) return say(result.error || "로그아웃하지 못했습니다");
-      // What was serving this backend has to go with it.
-      await call("/api/stop", { service: entry.backend });
+      // What was serving this account has to go with it.
+      await call("/api/stop", { service: account.id });
       await connectNow({ quiet: true });
     }));
-  } else if (entry.cliAvailable) {
+  } else if (login.cliAvailable) {
     buttons.append(button("로그인", "primary", async () => {
-      const result = await call("/api/login", { backend: entry.backend });
+      const result = await call("/api/login", { account: account.id });
       if (!result.ok) return say(result.error || "로그인을 시작하지 못했습니다");
-      say(`${entry.label} 로그인을 브라우저에서 끝내 주세요. 끝나면 알아서 연결합니다.`);
-      watchFor(entry.backend);
+      say(`${accountName(account, report.backends)} 로그인을 브라우저에서 끝내 주세요. 끝나면 알아서 연결합니다.`);
+      watchFor(account.id);
     }));
   }
+  if (siblings.length > 1) {
+    const index = siblings.findIndex(other => other.id === account.id);
+    const up = button("↑", "", () => move(account.id, "up"));
+    const down = button("↓", "", () => move(account.id, "down"));
+    up.title = "먼저 쓰기";
+    down.title = "나중에 쓰기";
+    if (index === 0) up.disabled = true;
+    if (index === siblings.length - 1) down.disabled = true;
+    buttons.append(up, down);
+  }
+  buttons.append(button("삭제", "", async () => {
+    const name = accountName(account, report.backends);
+    if (!window.confirm(`${name}을 지울까요? 로그아웃하고 이 계정의 로그인 폴더를 지웁니다.`)) return;
+    const result = await call("/api/accounts/remove", { account: account.id });
+    if (!result.ok) return say(result.error || "지우지 못했습니다");
+    await connectNow({ quiet: true });
+  }));
   row.append(buttons);
   return row;
+}
+
+async function move(id, direction) {
+  const result = await call("/api/accounts/move", { account: id, direction });
+  if (!result.ok) return say(result.error || "순서를 바꾸지 못했습니다");
+  // Order is priority, and the router reads it at start.
+  await connectNow({ quiet: true });
+}
+
+function renderAccounts(report) {
+  const target = document.getElementById("accounts");
+  target.textContent = "";
+  for (const backend of report.backends) {
+    const group = el("div", "group");
+    group.append(el("h3", "", backend.label));
+    const siblings = report.accounts.filter(account => account.backend === backend.name);
+    if (!siblings.length) group.append(el("p", "muted", "아직 계정이 없습니다."));
+    const rows = el("div", "rows");
+    for (const account of siblings) rows.append(accountRow(account, siblings, report));
+    if (siblings.length) group.append(rows);
+    group.append(button(`${backend.label} 계정 추가`, siblings.length ? "" : "primary", async () => {
+      const result = await call("/api/accounts/add", { backend: backend.name });
+      if (!result.ok) {
+        await refresh();
+        return say(result.error || "계정을 추가하지 못했습니다");
+      }
+      say(`${backend.label} 로그인을 브라우저에서 끝내 주세요. 끝나면 알아서 연결합니다.`);
+      await refresh();
+      watchFor(result.account.id);
+    }));
+    target.append(group);
+  }
 }
 
 function serviceRow(entry) {
@@ -153,18 +260,31 @@ function renderHeadline(report) {
   const badge = document.getElementById("connect-badge");
   const text = document.getElementById("connect-text");
   document.getElementById("endpoint-url").textContent = report.endpoint;
+  // A login the router does not answer with yet: after a reboot, after a login
+  // that finished once the screen stopped watching, or one whose start failed.
+  // Only a click starts anything, so a failing adapter is not respawned on every
+  // refresh.
+  const waiting = report.accounts.filter(account =>
+    account.login && account.login.loggedIn && !report.servingAccounts.includes(account.id));
+  document.getElementById("connect-now").hidden = waiting.length === 0;
   if (report.connected) {
     badge.className = "badge on";
     badge.textContent = "연결됨";
-    const names = report.servingBackends.map(name => BACKEND_LABEL[name] || name).join(", ");
-    text.textContent = `${names} 로 답합니다`;
+    const names = report.accounts
+      .filter(account => report.servingAccounts.includes(account.id))
+      .map(account => accountName(account, report.backends))
+      .join(", ");
+    const pending = waiting.map(account => accountName(account, report.backends)).join(", ");
+    text.textContent = pending
+      ? `${names} 로 답합니다. ${pending} 는 아직 안 떴습니다`
+      : `${names} 로 답합니다`;
     return;
   }
   badge.className = "badge off";
   badge.textContent = "연결 안 됨";
   text.textContent = report.ready
-    ? "로그인은 돼 있는데 아직 안 떴습니다. 자세히에서 이유를 볼 수 있습니다"
-    : "아래에서 로그인하세요";
+    ? "로그인은 돼 있는데 아직 안 떴습니다. 연결을 누르세요. 그래도 안 뜨면 자세히에서 이유를 볼 수 있습니다"
+    : "아래에서 계정을 추가하고 로그인하세요";
 }
 
 async function refresh() {
@@ -175,9 +295,8 @@ async function refresh() {
   }
   renderHeadline(report);
   document.getElementById("app-home").textContent = report.appHome;
-  const logins = document.getElementById("logins");
-  logins.textContent = "";
-  for (const entry of Object.values(report.logins)) logins.append(loginRow(entry));
+  renderModes(report);
+  renderAccounts(report);
   const services = document.getElementById("services");
   services.textContent = "";
   for (const entry of report.services) services.append(serviceRow(entry));
@@ -188,7 +307,9 @@ async function refresh() {
 /** Logging in is the whole decision; bringing up what it implies is not the user's job. */
 async function connectNow({ quiet = false } = {}) {
   if (!quiet) say("연결하는 중입니다…");
-  const result = await call("/api/connect");
+  // A body is what makes `call` a POST; without one this was a GET, which the
+  // server answers 404, so no login ever led to a connection.
+  const result = await call("/api/connect", {});
   await refresh();
   if (result.ok) say("");
   else if (!quiet) say(result.error || "연결하지 못했습니다");
@@ -200,12 +321,13 @@ async function connectNow({ quiet = false } = {}) {
  * Once the backend reports a login, connecting follows without another click.
  * Five minutes and it gives up, so an abandoned login leaves no timer running.
  */
-function watchFor(name) {
+function watchFor(accountId) {
   if (polling) clearInterval(polling);
   const deadline = Date.now() + 5 * 60 * 1000;
   polling = setInterval(async () => {
     const report = await refresh();
-    if (report.ok && report.logins[name] && report.logins[name].loggedIn) {
+    const account = report.ok ? report.accounts.find(entry => entry.id === accountId) : null;
+    if (account && account.login && account.login.loggedIn) {
       clearInterval(polling);
       polling = null;
       await connectNow();
@@ -218,6 +340,15 @@ function watchFor(name) {
     }
   }, 3000);
 }
+
+document.getElementById("connect-now").addEventListener("click", async (event) => {
+  event.target.disabled = true;
+  try {
+    await connectNow();
+  } finally {
+    event.target.disabled = false;
+  }
+});
 
 document.getElementById("copy-endpoint").addEventListener("click", async (event) => {
   const address = document.getElementById("endpoint-url").textContent;

@@ -4,10 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { authEnvironment, backend, loginStatus } from "../gateway/auth.mjs";
+import { addAccount, moveAccount, portBase, readAccounts, removeAccount, setMode } from "../gateway/accounts.mjs";
+import { authEnvironment, loginStatus } from "../gateway/auth.mjs";
 import { gatewayPaths } from "../gateway/paths.mjs";
 import { loadSecrets, SECRET_ENV } from "../gateway/secrets.mjs";
-import { routerConfig, serviceEnvironment, service } from "../gateway/services.mjs";
+import { adapterService, routerConfig, routerService, serviceEnvironment } from "../gateway/services.mjs";
 import { chatTest, connect, createHandler, requestAllowed, statusReport } from "./server.mjs";
 
 async function tempPaths(t) {
@@ -87,49 +88,99 @@ test("the keys are generated once, kept to this user, and never reach a response
   assert.deepEqual(report.secretEnvNames, SECRET_ENV);
 });
 
-test("each service is told where this gateway's own credentials live, not the user's", async (t) => {
+test("each account is told where its own credentials live, not the user's", async (t) => {
   const { paths } = await tempPaths(t);
   const { secrets } = await loadSecrets({ paths });
   const env = { PATH: "/usr/bin", HOME: "/home/someone" };
+  const codexAccount = await addAccount("codex", { paths, env });
+  const claudeAccount = await addAccount("claude", { paths, env });
 
-  const codex = serviceEnvironment(service("codex"), { secrets, paths, env });
-  assert.equal(codex.CODEX_HOME, paths.authDir("codex"));
-  assert.equal(codex.CODEX_AUTH_PATH, path.join(paths.authDir("codex"), "auth.json"));
+  const codex = serviceEnvironment(adapterService(codexAccount), { secrets, paths, env });
+  assert.equal(codex.CODEX_HOME, paths.authDir("codex", "codex-1"));
+  assert.equal(codex.CODEX_AUTH_PATH, path.join(paths.authDir("codex", "codex-1"), "auth.json"));
+  assert.equal(codex.PORT, String(codexAccount.port));
   assert.equal(codex.CODEX_PROXY_SHARED_SECRET, secrets.codex);
   assert.equal(codex.CLAUDE_PROXY_SHARED_SECRET, undefined, "a service gets only its own key");
 
-  const claude = serviceEnvironment(service("claude"), { secrets, paths, env });
-  assert.equal(claude.CLAUDE_CONFIG_DIR, paths.authDir("claude"));
+  const claude = serviceEnvironment(adapterService(claudeAccount), { secrets, paths, env });
+  assert.equal(claude.CLAUDE_CONFIG_DIR, paths.authDir("claude", "claude-1"));
   assert.equal(claude.CLAUDE_PROXY_SHARED_SECRET, secrets.claude);
 
-  // The router authenticates its own callers and also calls the two backends.
-  const router = serviceEnvironment(service("router"), { secrets, paths, env });
+  // The router authenticates its own callers and also calls the adapters.
+  const router = serviceEnvironment(routerService(env), { secrets, paths, env });
   assert.equal(router.ROUTER_PROXY_SHARED_SECRET, secrets.router);
   assert.equal(router.CODEX_PROXY_SHARED_SECRET, secrets.codex);
   assert.equal(router.CLAUDE_PROXY_SHARED_SECRET, secrets.claude);
   assert.equal(router.ROUTER_CONFIG, paths.routerConfigFile);
 
-  const home = authEnvironment(backend("claude"), { paths, env });
-  assert.equal(home.CLAUDE_CONFIG_DIR, paths.authDir("claude"));
+  const home = authEnvironment(claudeAccount, { paths, env });
+  assert.equal(home.CLAUDE_CONFIG_DIR, paths.authDir("claude", "claude-1"));
   assert.equal(home.HOME, "/home/someone", "the rest of the environment is passed through");
 });
 
-test("the router config lists only what is logged in and names keys instead of holding them", async (t) => {
+test("accounts get stable ids and ports, and order is kept per backend", async (t) => {
+  const { paths } = await tempPaths(t);
+  const env = {};
+  const base = portBase(env);
+  const first = await addAccount("codex", { paths, env });
+  const second = await addAccount("codex", { paths, env });
+  const claude = await addAccount("claude", { paths, env });
+  assert.deepEqual([first.id, second.id, claude.id], ["codex-1", "codex-2", "claude-1"]);
+  assert.deepEqual([first.port, second.port, claude.port], [base, base + 1, base + 2]);
+  await fsp.access(paths.authDir("codex", "codex-2"));
+
+  // A removed account's number and port are free again; its credentials are gone.
+  await removeAccount("codex-1", { paths });
+  await assert.rejects(fsp.access(paths.authDir("codex", "codex-1")));
+  const again = await addAccount("codex", { paths, env });
+  assert.equal(again.id, "codex-1");
+  assert.equal(again.port, base);
+
+  // Moving swaps with the neighbour of the same backend, skipping the others.
+  let state = await readAccounts({ paths });
+  assert.deepEqual(state.accounts.map(account => account.id), ["codex-2", "claude-1", "codex-1"]);
+  await moveAccount("codex-1", "up", { paths });
+  state = await readAccounts({ paths });
+  assert.deepEqual(state.accounts.map(account => account.id), ["codex-1", "claude-1", "codex-2"]);
+  await moveAccount("codex-1", "up", { paths });
+  assert.deepEqual((await readAccounts({ paths })).accounts.map(account => account.id), ["codex-1", "claude-1", "codex-2"], "the first stays first");
+
+  assert.equal(state.mode, "drain", "drain is the default");
+  await setMode("balance", { paths });
+  assert.equal((await readAccounts({ paths })).mode, "balance");
+  await assert.rejects(setMode("random", { paths }), /unknown mode/);
+
+  // A port the router or the screen is told to use is never handed to an adapter.
+  const { paths: other } = await tempPaths(t);
+  const reserved = await addAccount("claude", { paths: other, env: { GATEWAY_ROUTER_PORT: String(base) } });
+  assert.equal(reserved.port, base + 1);
+});
+
+test("the router config lists the logged-in accounts in order and names keys instead of holding them", async (t) => {
   const { paths } = await tempPaths(t);
   const { secrets } = await loadSecrets({ paths });
-  const config = routerConfig({ backends: ["codex"], env: {} });
-  assert.deepEqual(config.backends.map(entry => entry.name), ["codex"]);
+  const env = {};
+  const one = await addAccount("codex", { paths, env });
+  const two = await addAccount("codex", { paths, env });
+  const claude = await addAccount("claude", { paths, env });
+
+  const config = routerConfig({ accounts: [two, one], mode: "balance", env });
+  assert.deepEqual(config.backends.map(entry => entry.name), ["codex-2", "codex-1"], "the given order is the priority");
+  assert.equal(config.backends[0].baseUrl, `http://127.0.0.1:${two.port}/v1`);
   assert.equal(config.backends[0].apiKeyEnv, SECRET_ENV.codex);
   assert.equal(config.backends[0].discoverModels, true);
+  assert.deepEqual(config.routing, { mode: "balance" });
   assert.equal(config.clientAuthEnv, SECRET_ENV.router);
   assert.equal(config.listen.host, "127.0.0.1");
   const serialized = JSON.stringify(config);
   for (const value of Object.values(secrets)) assert.equal(serialized.includes(value), false);
 
-  const both = routerConfig({ backends: ["codex", "claude"], env: {}, ollamaBaseUrl: "http://127.0.0.1:11434/v1/" });
-  assert.deepEqual(both.backends.map(entry => entry.name), ["codex", "claude", "ollama"]);
+  const both = routerConfig({ accounts: [one, claude], env, ollamaBaseUrl: "http://127.0.0.1:11434/v1/" });
+  assert.deepEqual(both.backends.map(entry => entry.name), ["codex-1", "claude-1", "ollama"]);
+  assert.equal(both.backends[1].apiKeyEnv, SECRET_ENV.claude);
   assert.equal(both.backends[2].baseUrl, "http://127.0.0.1:11434/v1", "a trailing slash would break path joining");
   assert.equal(both.backends[2].apiKeyEnv, undefined, "Ollama has no key");
+  assert.deepEqual(both.routing, { mode: "drain" });
 });
 
 test("the chat test refuses when the router is down instead of calling a backend directly", async (t) => {
@@ -152,31 +203,39 @@ test("the chat test refuses when the router is down instead of calling a backend
 
 test("login status comes from the CLI, and a missing CLI is reported as such", async (t) => {
   const { paths } = await tempPaths(t);
-  const codexLoggedIn = await loginStatus("codex", {
+  const codex = await addAccount("codex", { paths, env: {} });
+  const claude = await addAccount("claude", { paths, env: {} });
+  // codex-cli 0.154 answers on stderr: this, with exit 0, when logged in.
+  const codexLoggedIn = await loginStatus(codex, {
     paths,
     env: {},
-    runner: async () => ({ stdout: "Logged in using ChatGPT\n", stderr: "" }),
+    runner: async () => ({ stdout: "", stderr: "Logged in using ChatGPT\n" }),
   });
   assert.equal(codexLoggedIn.loggedIn, true);
   assert.equal(codexLoggedIn.method, "ChatGPT");
-  assert.equal(codexLoggedIn.directory, paths.authDir("codex"));
+  assert.equal(codexLoggedIn.accountId, "codex-1");
+  assert.equal(codexLoggedIn.directory, paths.authDir("codex", "codex-1"));
 
-  const codexOut = await loginStatus("codex", {
+  // And "Not logged in" with exit 1, which execFile throws. A state, not a breakage.
+  const codexOut = await loginStatus(codex, {
     paths,
     env: {},
-    runner: async () => ({ stdout: "Not logged in\n", stderr: "" }),
+    runner: async () => { throw Object.assign(new Error("Command failed: codex login status"), { code: 1, stdout: "", stderr: "Not logged in\n" }); },
   });
+  assert.equal(codexOut.cliAvailable, true);
   assert.equal(codexOut.loggedIn, false);
+  assert.equal(codexOut.error, undefined);
 
-  const claudeIn = await loginStatus("claude", {
+  const claudeIn = await loginStatus(claude, {
     paths,
     env: {},
     runner: async () => ({ stdout: JSON.stringify({ loggedIn: true, authMethod: "claude.ai", subscriptionType: "max", email: "someone@example.com" }), stderr: "" }),
   });
   assert.equal(claudeIn.loggedIn, true);
   assert.equal(claudeIn.plan, "max");
+  assert.equal(claudeIn.account, "someone@example.com");
 
-  const missing = await loginStatus("claude", {
+  const missing = await loginStatus(claude, {
     paths,
     env: {},
     runner: async () => { throw Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" }); },
@@ -184,15 +243,50 @@ test("login status comes from the CLI, and a missing CLI is reported as such", a
   assert.equal(missing.cliAvailable, false);
   assert.match(missing.error, /not installed/);
 
-  // A non-zero exit that still says "not logged in" is a state, not a breakage.
-  const exited = await loginStatus("codex", {
+  // Both streams are read, so a CLI that prints its status on stdout still reads.
+  const onStdout = await loginStatus(codex, {
     paths,
     env: {},
-    runner: async () => { throw Object.assign(new Error("exit 1"), { stdout: "Not logged in\n" }); },
+    runner: async () => ({ stdout: "Logged in using ChatGPT\n", stderr: "" }),
   });
-  assert.equal(exited.cliAvailable, true);
-  assert.equal(exited.loggedIn, false);
-  assert.equal(exited.error, undefined);
+  assert.equal(onStdout.loggedIn, true);
+
+  // A failure the CLI explains, and an answer nothing here recognises, are both
+  // shown; neither may pass for "not logged in", which is how this once broke.
+  const broken = await loginStatus(codex, {
+    paths,
+    env: {},
+    runner: async () => { throw Object.assign(new Error("Command failed: codex login status"), { code: 1, stdout: "", stderr: "Error checking login status: permission denied\n" }); },
+  });
+  assert.equal(broken.loggedIn, false);
+  assert.match(broken.error, /Error checking login status/);
+  const silent = await loginStatus(codex, {
+    paths,
+    env: {},
+    runner: async () => ({ stdout: "", stderr: "" }),
+  });
+  assert.equal(silent.loggedIn, false);
+  assert.match(silent.error, /알아볼 수 없습니다/);
+});
+
+test("a Codex login says whose it is, from the id token, and nothing else from that file", async (t) => {
+  const { paths } = await tempPaths(t);
+  const account = await addAccount("codex", { paths, env: {} });
+  const claims = { email: "second@example.com", "https://api.openai.com/auth": { chatgpt_plan_type: "plus" } };
+  const idToken = ["e30", Buffer.from(JSON.stringify(claims)).toString("base64url"), "sig"].join(".");
+  const tokens = { id_token: idToken, access_token: "access-secret-value", refresh_token: "refresh-secret-value" };
+  await fsp.writeFile(path.join(paths.authDir("codex", account.id), "auth.json"), JSON.stringify({ tokens }));
+  const status = await loginStatus(account, {
+    paths,
+    env: {},
+    runner: async () => ({ stdout: "", stderr: "Logged in using ChatGPT\n" }),
+  });
+  assert.equal(status.account, "second@example.com");
+  assert.equal(status.plan, "plus");
+  const serialized = JSON.stringify(status);
+  for (const secret of ["access-secret-value", "refresh-secret-value", idToken]) {
+    assert.equal(serialized.includes(secret), false, "a token leaked into the login status");
+  }
 });
 
 test("the screen is served, an unknown path is a JSON 404, and a refused request never runs a handler", async (t) => {
@@ -223,15 +317,20 @@ test("the screen is served, an unknown path is a JSON 404, and a refused request
 
 test("logging in is the only decision: connecting brings up what that implies", async (t) => {
   const { paths } = await tempPaths(t);
-  const loggedOut = async () => ({ stdout: "Not logged in\n", stderr: "" });
+  const loggedOut = async () => { throw Object.assign(new Error("Command failed: codex login status"), { code: 1, stdout: "", stderr: "Not logged in\n" }); };
 
-  const nothing = await connect({ paths, env: {}, runner: loggedOut, fetchImpl: async () => { throw new Error("down"); } });
-  assert.equal(nothing.ok, false);
-  assert.match(nothing.error, /로그인된 것이 없습니다/);
-  assert.deepEqual(nothing.steps, [], "nothing should be started for a machine with no login");
+  const empty = await connect({ paths, env: {}, runner: loggedOut, fetchImpl: async () => { throw new Error("down"); } });
+  assert.equal(empty.ok, false);
+  assert.match(empty.error, /로그인된 계정이 없습니다/);
+  assert.deepEqual(empty.steps, [], "nothing should be started for a machine with no login");
 
-  // Codex logged in, Claude not: only the one adapter comes up, and the router
-  // is restarted so it reads the new backend list instead of the previous one.
+  await addAccount("codex", { paths, env: {} });
+  await addAccount("claude", { paths, env: {} });
+  await addAccount("codex", { paths, env: {} });
+  await setMode("balance", { paths });
+
+  // Both Codex accounts logged in, Claude not: only those adapters come up, and
+  // the router is restarted so it reads the new account list, not the previous one.
   const started = [];
   const stopped = [];
   const result = await connect({
@@ -239,16 +338,82 @@ test("logging in is the only decision: connecting brings up what that implies", 
     env: {},
     fetchImpl: async () => { throw new Error("down"); },
     runner: async (bin, args) => (args[0] === "login"
-      ? { stdout: "Logged in using ChatGPT\n", stderr: "" }
+      ? { stdout: "", stderr: "Logged in using ChatGPT\n" }
       : { stdout: JSON.stringify({ loggedIn: false, authMethod: "none" }), stderr: "" }),
-    starter: async (name) => { started.push(name); return { ok: true, status: { name, running: true } }; },
-    stopper: async (name) => { stopped.push(name); return { ok: true }; },
+    starter: async (entry) => { started.push(entry.key); return { ok: true, status: { name: entry.key, running: true } }; },
+    stopper: async (entry) => { stopped.push(entry.key); return { ok: true }; },
   });
   assert.equal(result.ok, true);
-  assert.deepEqual(result.connected, ["codex"]);
-  assert.deepEqual(started, ["codex", "router"], "the router must come up after the backend it will route to");
-  assert.deepEqual(stopped, ["router"], "a running router holds the previous backend list");
+  assert.deepEqual(result.connected, ["codex-1", "codex-2"]);
+  assert.deepEqual(started, ["codex-1", "codex-2", "router"], "the router must come up after the adapters it will route to");
+  assert.deepEqual(stopped, ["router"], "a running router holds the previous account list");
 
   const config = JSON.parse(await fsp.readFile(paths.routerConfigFile, "utf8"));
-  assert.deepEqual(config.backends.map(entry => entry.name), ["codex"]);
+  assert.deepEqual(config.backends.map(entry => entry.name), ["codex-1", "codex-2"]);
+  assert.deepEqual(config.routing, { mode: "balance" });
+});
+
+test("the status report shows each account with its login, its adapter and the router's view of it", async (t) => {
+  const { paths } = await tempPaths(t);
+  const env = { GATEWAY_ROUTER_PORT: "11400" };
+  const one = await addAccount("codex", { paths, env });
+  await addAccount("codex", { paths, env });
+  // Its adapter is up, but it logged in after the router started, so the router
+  // does not know it.
+  const late = await addAccount("claude", { paths, env });
+  const routerHealth = {
+    status: "ok",
+    backends: [
+      { name: "codex-1", routing: { cooldown_until: "2099-01-01T00:00:00.000Z", consecutive_limits: 1, requests_in_window: 7 } },
+      { name: "codex-2", routing: { cooldown_until: null, consecutive_limits: 0, requests_in_window: 3 } },
+    ],
+  };
+  const fetchImpl = async (url) => {
+    const target = String(url);
+    if (target === "http://127.0.0.1:11400/health") return new Response(JSON.stringify(routerHealth), { status: 200 });
+    if (target === "http://127.0.0.1:11400/v1/models") return new Response(JSON.stringify({ data: [{ id: "gpt-6-luna", owned_by: "codex-1" }] }), { status: 200 });
+    if (target === `http://127.0.0.1:${one.port}/health`) return new Response("{}", { status: 200 });
+    if (target === `http://127.0.0.1:${late.port}/health`) return new Response("{}", { status: 200 });
+    throw new Error("connection refused");
+  };
+  const report = await statusReport({
+    paths,
+    env,
+    fetchImpl,
+    runner: async (bin, args) => (args[0] === "login"
+      ? { stdout: "", stderr: "Logged in using ChatGPT\n" }
+      : { stdout: JSON.stringify({ loggedIn: true, authMethod: "claude.ai" }), stderr: "" }),
+  });
+  assert.equal(report.mode, "drain");
+  assert.deepEqual(report.accounts.map(account => account.id), ["codex-1", "codex-2", "claude-1"]);
+  assert.equal(report.accounts[2].service.running, true);
+  assert.equal(report.accounts[2].routing, null);
+  assert.equal(report.accounts[0].login.loggedIn, true);
+  assert.equal(report.accounts[0].service.running, true);
+  assert.equal(report.accounts[1].service.running, false);
+  assert.equal(report.accounts[0].routing.requests_in_window, 7);
+  assert.equal(report.accounts[0].routing.cooldown_until, "2099-01-01T00:00:00.000Z");
+  assert.deepEqual(report.servingAccounts, ["codex-1"], "an adapter the router does not route to is not serving");
+  assert.equal(report.connected, true);
+  assert.deepEqual(report.models.models.map(model => model.id), ["gpt-6-luna"]);
+});
+
+test("the account and mode endpoints refuse what they do not know", async (t) => {
+  const { paths } = await tempPaths(t);
+  const handler = createHandler({ paths, env: {}, fetchImpl: async () => { throw new Error("down"); }, port: 11450 });
+  const post = async (url, body) => {
+    const response = fakeResponse();
+    await handler(fakeRequest({ method: "POST", url, contentType: "application/json", body: JSON.stringify(body) }), response);
+    return { status: response.captured.status, body: JSON.parse(response.captured.body || "{}") };
+  };
+
+  assert.equal((await post("/api/accounts/add", { backend: "gemini" })).status, 400);
+  assert.equal((await post("/api/mode", { mode: "random" })).status, 400);
+  const mode = await post("/api/mode", { mode: "balance" });
+  assert.equal(mode.status, 200);
+  assert.equal((await readAccounts({ paths })).mode, "balance");
+  assert.equal((await post("/api/accounts/move", { account: "codex-9", direction: "up" })).status, 404);
+  assert.equal((await post("/api/login", { account: "codex-9" })).status, 404);
+  assert.equal((await post("/api/accounts/remove", { account: "codex-9" })).status, 404);
+  assert.equal((await post("/api/start", { service: "codex-9" })).status, 404);
 });
