@@ -83,8 +83,10 @@ function modelLabel(effort) {
 // Text-only requests run with every tool disabled and a single turn. `claude -p`
 // cannot take images on stdin, so an image request instead writes the images to
 // a private directory, runs there, and gets `Read` (and only `Read`) enabled so
-// it can open them. Each Read costs a turn, hence `images + 2`.
-export function claudeArgsFor(imageCount = 0, model = DEFAULT_MODEL) {
+// it can open them. Each Read costs a turn, hence `images + 2`. A text-only
+// request with a schema gets a second turn, for the CLI to ask again when the
+// model wrote its JSON as text (see STRUCTURED_OUTPUT_INSTRUCTION).
+export function claudeArgsFor(imageCount = 0, model = DEFAULT_MODEL, withSchema = false) {
   const withImages = imageCount > 0;
   return [
     '-p',
@@ -93,7 +95,7 @@ export function claudeArgsFor(imageCount = 0, model = DEFAULT_MODEL) {
     '--no-session-persistence',
     '--setting-sources', '',
     '--strict-mcp-config',
-    '--max-turns', String(withImages ? imageCount + 2 : 1),
+    '--max-turns', String(withImages ? imageCount + 2 : (withSchema ? 2 : 1)),
     '--output-format', 'json',
   ];
 }
@@ -530,6 +532,15 @@ export function resolveEffort(body, defaultEffort = DEFAULT_EFFORT) {
   return requested;
 }
 
+// `--json-schema` gives the model a StructuredOutput tool and takes the answer
+// only from a call to it. A caller's system prompt such as "Return exactly one
+// JSON object" can lead the model to write the JSON as text instead. CLI 2.1.285
+// then asks for the call in another turn; past --max-turns the run ends as
+// error_max_turns with no result, a 502 here. On the meeting assistant's prompts
+// Sonnet 5.5 did that in 20 of 28 tries and Opus 5.5 in 2 of 273 logged
+// requests. With this line Sonnet called the tool in 32 of 32.
+const STRUCTURED_OUTPUT_INSTRUCTION = 'Give your answer by calling the StructuredOutput tool with the JSON object as its input. Do not write the JSON as text.';
+
 export function buildInvocation(body, defaultEffort = DEFAULT_EFFORT) {
   const effort = resolveEffort(body, defaultEffort);
   const { systemPrompt, body: promptBody, images } = flattenMessages(body?.messages);
@@ -556,9 +567,10 @@ export function buildInvocation(body, defaultEffort = DEFAULT_EFFORT) {
       mode = 'json_object';
     }
   }
+  if (schema) systemParts.push(STRUCTURED_OUTPUT_INSTRUCTION);
 
   const finalSystemPrompt = systemParts.filter(Boolean).join('\n\n').trim();
-  const args = [...claudeArgsFor(images.length, resolveModel(body?.model)), '--effort', effort, '--system-prompt', finalSystemPrompt];
+  const args = [...claudeArgsFor(images.length, resolveModel(body?.model), Boolean(schema)), '--effort', effort, '--system-prompt', finalSystemPrompt];
   if (schema) args.push('--json-schema', JSON.stringify(schema));
 
   // The image paths only exist once the files are on disk, so the prompt is

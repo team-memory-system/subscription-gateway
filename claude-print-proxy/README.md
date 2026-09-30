@@ -26,6 +26,11 @@ set PORT=11446 for the managed configuration.
 - System/developer messages form the system prompt. Multiple messages and tool
   results are rendered as a transcript. OpenAI tools/tool_choice and JSON schema
   are emulated with structured CLI output.
+- The CLI takes a schema answer only from a call to its StructuredOutput tool. A
+  request with a schema therefore ends its system prompt with a line saying so,
+  and gets a second turn (`--max-turns 2`) for the CLI to ask again if the model
+  still writes the JSON as text. Without both, a caller prompt like "Return
+  exactly one JSON object" made Sonnet 5.5 fail 20 of 28 requests with a 502.
 - Streaming is buffered: complete result, then SSE chunks and DONE.
 - CLI settings discovery, MCP, conversation persistence and built-in tools are
   disabled. Image requests enable only Read in a private request directory.

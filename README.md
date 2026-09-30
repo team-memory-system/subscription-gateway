@@ -123,13 +123,21 @@ consumer terms say the same.
   `--system-prompt`. `--json-schema` has no file form and stays on the command
   line, which reaches `claude.exe` directly and never `cmd.exe`: the adapter
   refuses a `CLAUDE_BIN` that only `cmd.exe` could run.
+- **A schema answer written as text is lost.** With `--json-schema` the CLI takes
+  the answer only from a StructuredOutput tool call. A caller prompt like "Return
+  exactly one JSON object" made Sonnet 5.5 write the JSON as text instead. The CLI
+  then asked for the tool call in a second turn, which `--max-turns 1` refused, and
+  the run ended as `error_max_turns` with no result: a 502 in 20 of 28 tries. The
+  Claude adapter now tells the model to call the tool and allows that second turn.
+  `claude -p --output-format stream-json --verbose` shows each turn when a 502
+  needs explaining.
 
 ### Verify a change
 
 ```sh
 npm test                                               # all of the below
 cd codex-openai-proxy && node --test server.test.mjs   # 23
-cd claude-print-proxy && node --test server.test.mjs   # 60
+cd claude-print-proxy && node --test server.test.mjs   # 61
 cd router            && node --test server.test.mjs    # 42
 cd ui                && node --test server.test.mjs    # 13
 node --test gateway/command.test.mjs                   # 7

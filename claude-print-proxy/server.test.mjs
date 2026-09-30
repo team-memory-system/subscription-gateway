@@ -492,6 +492,30 @@ test('response_format json_object augments the system prompt without a schema', 
   });
 });
 
+test('a schema request is told to answer through StructuredOutput and gets a second turn', () => {
+  // A caller asking for "exactly one JSON object" made Sonnet 5.5 write the JSON
+  // as text, and with one turn the CLI ended the run as error_max_turns.
+  const messages = [{ role: 'system', content: 'Return exactly one JSON object.' }, { role: 'user', content: 'hi' }];
+  const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] };
+  const instruction = /\n\nGive your answer by calling the StructuredOutput tool with the JSON object as its input\. Do not write the JSON as text\.$/;
+
+  const structured = buildInvocation({ messages, response_format: { type: 'json_schema', json_schema: { name: 'answer', schema } } });
+  assert.match(argValue(structured.args, '--system-prompt'), /^Return exactly one JSON object\./);
+  assert.match(argValue(structured.args, '--system-prompt'), instruction);
+  assert.equal(argValue(structured.args, '--max-turns'), '2');
+
+  const tools = buildInvocation({ messages, tools: [{ type: 'function', function: { name: 'a', parameters: { type: 'object', properties: {} } } }] });
+  assert.match(argValue(tools.args, '--system-prompt'), instruction);
+  assert.equal(argValue(tools.args, '--max-turns'), '2');
+
+  // Without a schema the CLI offers no StructuredOutput tool to point at.
+  for (const body of [{ messages }, { messages, response_format: { type: 'json_object' } }]) {
+    const { args } = buildInvocation(body);
+    assert.doesNotMatch(argValue(args, '--system-prompt'), /StructuredOutput/);
+    assert.equal(argValue(args, '--max-turns'), '1');
+  }
+});
+
 test('stream:true emits two chunks plus [DONE], with usage when requested', async () => {
   const runClaude = makeRunner(okPayload('streamed answer'));
   await withServer({ runClaude }, async (baseUrl) => {
