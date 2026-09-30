@@ -1,18 +1,23 @@
-# Local LLM Proxy
+# Subscription Gateway
 
-Turns subscription accounts into OpenAI-compatible HTTP APIs, plus a router that
-picks between them. Honcho and WeKnora are consumers; neither packages nor manages
-these services.
+A standalone OpenAI-compatible gateway for Codex and Claude subscription accounts,
+with its own login screen, account storage, adapters, and model router. It is
+developed and released independently at
+[`chenjingdev/subscription-gateway`](https://github.com/chenjingdev/subscription-gateway).
+Honcho, WeKnora, and other applications can use its API.
 
 ## Read this first (for agents)
 
-One of three repositories in the memory system.
+The gateway owns its processes, logins, and per-user autostart. Team Memory System
+uses it as an external dependency: `honcho-agent-bridge` downloads a pinned source
+revision and calls the gateway's own installation CLI. The gateway can also be
+installed and used on its own.
 
 | Repository | What it is | Installed where |
 |---|---|---|
 | [`honcho-selfhost`](https://github.com/team-memory-system/honcho-selfhost) | The memory server, a fork of `plastic-labs/honcho` (AGPL-3.0) | One computer per person |
 | [`honcho-agent-bridge`](https://github.com/team-memory-system/honcho-agent-bridge) | Collector, installer, agent plugin | Every machine that runs an agent |
-| **`subscription-gateway`** (this one) | Subscription-to-API adapters and a router | Only the computer that runs Honcho |
+| **`subscription-gateway`** (this one, maintained under `chenjingdev`) | Reusable subscription-to-API adapters and a router | Any computer that needs a subscription-backed API; the Honcho server's computer when used by Team Memory System |
 
 ### Why these cannot move into Docker
 
