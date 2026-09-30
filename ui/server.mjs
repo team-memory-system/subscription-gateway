@@ -24,6 +24,8 @@ import { gatewayPaths } from "../gateway/paths.mjs";
 import { loadSecrets, SECRET_ENV } from "../gateway/secrets.mjs";
 import {
   adapterService,
+  emptyModelsReason,
+  probeHealth,
   routerConfig,
   routerService,
   serviceStatus,
@@ -126,13 +128,14 @@ export async function statusReport({
   const state = await readAccounts({ paths });
   const ask = runner ? { paths, env, runner } : { paths, env };
   const router = routerService(env);
-  const [{ secrets }, logins, adapters, routerStatus] = await Promise.all([
-    secretsLoader({ paths }),
+  // The keys first: they are what tells a service of ours from a stale one on its port.
+  const { secrets } = await secretsLoader({ paths });
+  const [logins, adapters, routerStatus] = await Promise.all([
     Promise.all(state.accounts.map(account => loginStatus(account, ask))),
-    Promise.all(state.accounts.map(account => serviceStatus(adapterService(account), { paths, fetchImpl }))),
-    serviceStatus(router, { paths, fetchImpl }),
+    Promise.all(state.accounts.map(account => serviceStatus(adapterService(account), { paths, fetchImpl, secrets }))),
+    serviceStatus(router, { paths, fetchImpl, secrets }),
   ]);
-  let models = { ok: false, reason: "라우터가 실행 중이 아닙니다" };
+  let models = { ok: false, reason: routerStatus.foreign ? routerStatus.error : "라우터가 실행 중이 아닙니다" };
   if (routerStatus.running && secrets.router) {
     models = await routerModels({ secrets, env, fetchImpl });
   } else if (routerStatus.running) {
@@ -179,7 +182,11 @@ async function routerModels({ secrets, env = process.env, fetchImpl = globalThis
     if (!response.ok) return { ok: false, reason: `라우터가 HTTP ${response.status} 를 돌려줬습니다` };
     const body = await response.json();
     const data = Array.isArray(body?.data) ? body.data : [];
-    return { ok: true, models: data.map(entry => ({ id: entry?.id, ownedBy: entry?.owned_by })).filter(entry => entry.id) };
+    const models = data.map(entry => ({ id: entry?.id, ownedBy: entry?.owned_by })).filter(entry => entry.id);
+    if (models.length) return { ok: true, models };
+    // The listing just asked every backend, so /health now says how each went.
+    const health = await probeHealth(serviceUrl(routerService(env)), { fetchImpl });
+    return { ok: true, models, reason: emptyModelsReason(health.body) || "라우터에 연결된 계정이 없습니다. 계정에 로그인하고 연결을 누르세요" };
   } catch (error) {
     return { ok: false, reason: String(error?.message || error).slice(0, 200) };
   }
@@ -265,7 +272,13 @@ export async function connect({ paths = gatewayPaths(), env = process.env, fetch
   const steps = [];
   for (const account of accounts) {
     const result = await starter(adapterService(account), { secrets, paths, env, fetchImpl });
-    steps.push({ service: account.id, ok: result.ok, alreadyRunning: Boolean(result.alreadyRunning), error: result.error });
+    steps.push({
+      service: account.id,
+      ok: result.ok,
+      alreadyRunning: Boolean(result.alreadyRunning),
+      ...(result.foreign ? { foreign: true } : {}),
+      error: result.error,
+    });
   }
   const applied = await applyRouterConfig({ accounts, mode, paths, env });
   if (!applied.ok) return { ok: false, error: applied.error, steps };
@@ -273,7 +286,7 @@ export async function connect({ paths = gatewayPaths(), env = process.env, fetch
   // Stop first: a router already up is holding the previous account list.
   await stopper(router, { paths, env, fetchImpl });
   const started = await starter(router, { secrets, paths, env, fetchImpl });
-  steps.push({ service: "router", ok: started.ok, error: started.error });
+  steps.push({ service: "router", ok: started.ok, ...(started.foreign ? { foreign: true } : {}), error: started.error });
   const failed = steps.filter(step => !step.ok);
   return {
     ok: failed.length === 0,
@@ -359,7 +372,7 @@ export function createKeeper({
       if (held.has(entry.key)) continue;
       const waiting = retry.get(entry.key);
       if (waiting && now() < waiting.nextAt) continue;
-      if ((await serviceStatus(entry, { paths, fetchImpl })).running) {
+      if ((await serviceStatus(entry, { paths, fetchImpl, secrets })).running) {
         retry.delete(entry.key);
         continue;
       }

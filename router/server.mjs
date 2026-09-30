@@ -303,6 +303,11 @@ export function lookupCandidates(model) {
 export function createRegistry(config, { fetchImpl = fetch, env = process.env, now = () => Date.now(), log = () => {} } = {}) {
   const cache = new Map();
   const inflight = new Map();
+  // How each backend's last discovery went, for /health. A backend that lists
+  // nothing because it refused this router's key (an adapter left behind by an
+  // earlier install, holding its old key) must be told apart from one that has
+  // no account behind it.
+  const outcomes = new Map();
 
   async function fetchModels(backend) {
     const headers = { accept: 'application/json' };
@@ -312,7 +317,7 @@ export function createRegistry(config, { fetchImpl = fetch, env = process.env, n
       headers,
       signal: AbortSignal.timeout(config.discoverTimeoutMs),
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
     const payload = await response.json();
     const data = Array.isArray(payload?.data) ? payload.data : [];
     return data.map((entry) => (typeof entry?.id === 'string' ? entry.id.trim() : '')).filter(Boolean);
@@ -328,11 +333,19 @@ export function createRegistry(config, { fetchImpl = fetch, env = process.env, n
     const task = fetchModels(backend)
       .then((ids) => {
         cache.set(backend.name, { ids, fetchedAt: now(), ok: true });
+        outcomes.set(backend.name, { ok: true, status: 200, reason: null, models: ids.length, at: new Date(now()).toISOString() });
         return ids;
       })
       .catch((error) => {
         const ids = cached?.ids ?? [];
         cache.set(backend.name, { ids, fetchedAt: now(), ok: false });
+        outcomes.set(backend.name, {
+          ok: false,
+          status: Number.isInteger(error?.status) ? error.status : null,
+          reason: redact(error?.message || error).slice(0, 200),
+          models: ids.length,
+          at: new Date(now()).toISOString(),
+        });
         log({ event: 'model_discovery_failed', backend: backend.name, reason: redact(error?.message || error), retained: ids.length });
         return ids;
       })
@@ -382,6 +395,10 @@ export function createRegistry(config, { fetchImpl = fetch, env = process.env, n
       return data;
     },
     candidates,
+    /** The last discovery of one backend: { ok, status, reason, models, at }, or null before any. */
+    discovery(name) {
+      return outcomes.get(name) ?? null;
+    },
     async resolve(model) {
       return (await candidates(model))[0] ?? null;
     },
@@ -936,7 +953,15 @@ export function createHandler({
           listen: { host: config.host, port: config.port },
           client_auth: Boolean(secret),
           routing: { mode: config.routing.mode, window_ms: config.routing.windowMs },
-          backends: probes.map((entry, index) => ({ ...entry, routing: routing.snapshot(config.backends[index]) })),
+          backends: probes.map((entry, index) => ({
+            ...entry,
+            routing: routing.snapshot(config.backends[index]),
+            // Whether the last /models asked of it worked, and if not, its status:
+            // a 401 here means the backend does not know this router's key.
+            discovery: config.backends[index].discoverModels && registry.discovery
+              ? registry.discovery(config.backends[index].name)
+              : null,
+          })),
         });
       }
 

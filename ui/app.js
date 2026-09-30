@@ -102,7 +102,8 @@ function accountRow(account, siblings, report) {
   const cooling = account.routing && account.routing.cooldown_until
     && new Date(account.routing.cooldown_until).getTime() > Date.now();
   if (login.loggedIn && account.service) {
-    if (cooling) row.append(el("span", "badge wait", "쉬는 중"));
+    if (account.service.foreign) row.append(el("span", "badge off", "포트 막힘"));
+    else if (cooling) row.append(el("span", "badge wait", "쉬는 중"));
     else row.append(el("span", `badge ${account.service.running ? "on" : "off"}`, account.service.running ? "쓰는 중" : "안 뜸"));
   }
 
@@ -114,6 +115,9 @@ function accountRow(account, siblings, report) {
   if (duplicate) parts.push("같은 계정이 두 번 들어가 있습니다");
   if (!login.cliAvailable) parts.push(login.error || `${account.backend} 명령을 찾을 수 없습니다`);
   else if (login.error) parts.push(login.error);
+  // Its port is held by a program that refuses this gateway's key, most likely
+  // an adapter an earlier install left running: say so, on the account it blocks.
+  if (account.service && account.service.foreign && account.service.error) parts.push(account.service.error);
   const routing = routingText(account.routing);
   if (routing) parts.push(routing);
   row.append(el("div", "detail", parts.join("  ·  ")));
@@ -191,8 +195,9 @@ function renderAccounts(report) {
 function serviceRow(entry) {
   const row = el("div", "row");
   row.append(el("div", "name", entry.label));
-  row.append(el("span", `badge ${entry.running ? "on" : "off"}`, entry.running ? "실행 중" : "멈춤"));
+  row.append(el("span", `badge ${entry.running ? "on" : "off"}`, entry.running ? "실행 중" : entry.foreign ? "포트 막힘" : "멈춤"));
   const parts = [entry.url];
+  if (entry.foreign && entry.error) parts.push(entry.error);
   if (entry.running && !entry.managed) parts.push("이 화면이 시작한 것이 아닙니다");
   if (!entry.dependenciesReady) parts.push("의존성 미설치");
   // A stopped service has nothing listening, and the badge already says so. The
@@ -229,7 +234,7 @@ function renderModels(models) {
     return [];
   }
   if (!models.models.length) {
-    target.append(el("p", "muted", "라우터가 아는 모델이 없습니다."));
+    target.append(el("p", "muted", models.reason || "라우터가 아는 모델이 없습니다."));
     return [];
   }
   for (const model of models.models) {

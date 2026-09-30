@@ -41,7 +41,7 @@ import {
 import { commandInvocation, invocationOptions } from "./command.mjs";
 import { gatewayPaths, sourceRoot, userHome } from "./paths.mjs";
 import { loadSecrets, readSecrets } from "./secrets.mjs";
-import { adapterService, dependencyFolders, probeHealth, routerService, serviceUrl, stopService } from "./services.mjs";
+import { adapterService, dependencyFolders, emptyModelsReason, probeHealth, routerService, serviceUrl, stopService } from "./services.mjs";
 
 export const COMMANDS = Object.freeze(["install", "uninstall", "status", "connect-info", "open"]);
 const USAGE = `사용법: node gateway/cli.mjs <${COMMANDS.join("|")}>`;
@@ -250,6 +250,8 @@ async function status(ctx) {
       backend: account.backend,
       loggedIn: account.login?.loggedIn === true,
       serving: serving.has(account.id),
+      // A port held by something that refuses this gateway's key, in its words.
+      ...(account.service?.foreign && typeof account.service.error === "string" ? { error: account.service.error } : {}),
     })),
     models: report.models?.ok && Array.isArray(report.models.models)
       ? report.models.models.map(model => model?.id).filter(id => typeof id === "string" && id)
@@ -275,7 +277,14 @@ async function routerModels(ctx, apiKey) {
   if (!response.ok) return { models: [], reason: `라우터가 HTTP ${response.status} 를 돌려줬습니다` };
   const body = await response.json().catch(() => null);
   const models = (Array.isArray(body?.data) ? body.data : []).map(entry => entry?.id).filter(id => typeof id === "string" && id);
-  if (!models.length) return { models, reason: `라우터에 연결된 계정이 없습니다. 게이트웨이 화면(${ctx.uiUrl})에서 로그인하세요` };
+  if (!models.length) {
+    // Each backend's last discovery is on the router's /health: an adapter that
+    // refuses the router's key is not the same as no account at all.
+    const health = await probeHealth(ctx.routerUrl.replace(/\/v1$/, ""), { fetchImpl: ctx.fetchImpl, timeoutMs: 5_000 });
+    const why = emptyModelsReason(health.body);
+    if (why) return { models, reason: `${why}. 게이트웨이 화면: ${ctx.uiUrl}` };
+    return { models, reason: `라우터에 연결된 계정이 없습니다. 게이트웨이 화면(${ctx.uiUrl})에서 로그인하세요` };
+  }
   return { models };
 }
 

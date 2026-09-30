@@ -8,7 +8,7 @@ import { addAccount, moveAccount, portBase, readAccounts, removeAccount, setMode
 import { authEnvironment, loginStatus } from "../gateway/auth.mjs";
 import { gatewayPaths } from "../gateway/paths.mjs";
 import { loadSecrets, SECRET_ENV } from "../gateway/secrets.mjs";
-import { adapterService, routerConfig, routerService, serviceEnvironment } from "../gateway/services.mjs";
+import { adapterService, routerConfig, routerService, serviceEnvironment, startService } from "../gateway/services.mjs";
 import { chatTest, connect, createHandler, createKeeper, requestAllowed, statusReport } from "./server.mjs";
 
 async function tempPaths(t) {
@@ -402,6 +402,89 @@ test("the status report shows each account with its login, its adapter and the r
   assert.deepEqual(report.servingAccounts, ["codex-1"], "an adapter the router does not route to is not serving");
   assert.equal(report.connected, true);
   assert.deepEqual(report.models.models.map(model => model.id), ["gpt-6-luna"]);
+});
+
+const LOGGED_IN = async (bin, args) => (args[0] === "login"
+  ? { stdout: "", stderr: "Logged in using ChatGPT\n" }
+  : { stdout: JSON.stringify({ loggedIn: true, authMethod: "claude.ai" }), stderr: "" });
+
+test("an adapter left by an earlier install shows on its account, and an empty model list says the keys were refused", async (t) => {
+  const { paths } = await tempPaths(t);
+  const env = { GATEWAY_ROUTER_PORT: "11400" };
+  const codex = await addAccount("codex", { paths, env });
+  const claude = await addAccount("claude", { paths, env });
+  const { secrets } = await loadSecrets({ paths });
+  // The router is this install's (its pid file is ours); both adapters answer
+  // /health but refuse this install's keys.
+  await fsp.mkdir(paths.runtimeDir, { recursive: true });
+  await fsp.writeFile(paths.pidFile("router"), JSON.stringify({ pid: process.pid }));
+  const refused = { ok: false, status: 401, reason: "HTTP 401", models: 0, at: "2026-10-01T00:00:00.000Z" };
+  const routerHealth = {
+    status: "ok",
+    backends: [
+      { name: "codex-1", reachable: true, routing: { requests_in_window: 0 }, discovery: refused },
+      { name: "claude-1", reachable: true, routing: { requests_in_window: 0 }, discovery: refused },
+    ],
+  };
+  const adapterPorts = new Set([codex.port, claude.port]);
+  const fetchImpl = async (url, options = {}) => {
+    const target = new URL(String(url));
+    const port = Number(target.port);
+    if (port === 11400 && target.pathname === "/health") return new Response(JSON.stringify(routerHealth));
+    if (port === 11400 && target.pathname === "/v1/models") {
+      assert.equal(options.headers.authorization, `Bearer ${secrets.router}`);
+      return new Response(JSON.stringify({ object: "list", data: [] }));
+    }
+    if (adapterPorts.has(port) && target.pathname === "/health") return new Response('{"status":"ok"}');
+    if (adapterPorts.has(port) && target.pathname === "/v1/models") return new Response('{"error":"Unauthorized"}', { status: 401 });
+    throw new Error("connection refused");
+  };
+  const report = await statusReport({ paths, env, fetchImpl, runner: LOGGED_IN });
+  for (const account of report.accounts) {
+    assert.equal(account.service.running, false, account.id);
+    assert.equal(account.service.foreign, true, account.id);
+    assert.match(account.service.error, new RegExp(`^포트 ${account.port}을 이 게이트웨이의 키를 모르는 다른 프로그램이 쓰고 있습니다`));
+  }
+  assert.equal(report.connected, false);
+  assert.deepEqual(report.models.models, []);
+  assert.match(report.models.reason, /어댑터가 키를 거절합니다 \(codex-1: HTTP 401, claude-1: HTTP 401\)/);
+  assert.equal(report.models.reason.includes("연결된 계정이 없습니다"), false, "not mistaken for no account at all");
+  for (const value of Object.values(secrets)) assert.equal(JSON.stringify(report).includes(value), false);
+
+  // Connecting reports it instead of counting those adapters as already up.
+  const processes = { listeners: async () => [], describe: async () => null, stop: async () => assert.fail("nothing is stopped") };
+  const result = await connect({
+    paths,
+    env,
+    fetchImpl,
+    runner: LOGGED_IN,
+    starter: async (entry, options) => (entry.kind === "router"
+      ? { ok: true }
+      : startService(entry, { ...options, processes, spawnImpl: () => assert.fail("nothing is spawned") })),
+    stopper: async () => ({ ok: true }),
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.steps.map(step => [step.service, step.ok, step.alreadyRunning, step.foreign]), [
+    ["codex-1", false, false, true],
+    ["claude-1", false, false, true],
+    ["router", true, undefined, undefined],
+  ]);
+  assert.match(result.error, new RegExp(`포트 ${codex.port}을 이 게이트웨이의 키를 모르는`));
+});
+
+test("an empty model list with nothing refused still says no account is connected", async (t) => {
+  const { paths } = await tempPaths(t);
+  const env = { GATEWAY_ROUTER_PORT: "11400" };
+  await fsp.mkdir(paths.runtimeDir, { recursive: true });
+  await fsp.writeFile(paths.pidFile("router"), JSON.stringify({ pid: process.pid }));
+  const fetchImpl = async (url) => {
+    const target = new URL(String(url));
+    if (target.pathname === "/health") return new Response(JSON.stringify({ status: "ok", backends: [] }));
+    if (target.pathname === "/v1/models") return new Response(JSON.stringify({ data: [] }));
+    throw new Error("connection refused");
+  };
+  const report = await statusReport({ paths, env, fetchImpl, runner: async () => ({ stdout: "", stderr: "" }) });
+  assert.match(report.models.reason, /연결된 계정이 없습니다/);
 });
 
 test("the account and mode endpoints refuse what they do not know", async (t) => {

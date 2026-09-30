@@ -629,6 +629,13 @@ test("connect-info gives the router's address and key, and is ready only when th
   const empty = await runCli(["connect-info"], { ...base, fetchImpl: router(200, { data: [] }) });
   assert.equal(empty.result.ready, false);
   assert.match(empty.result.reason, /연결된 계정이 없습니다/);
+  // The adapters refused the router's key (an earlier install's adapters on the ports): said as such.
+  const staleAdapters = async (url) => (String(url).endsWith("/health")
+    ? new Response(JSON.stringify({ status: "ok", backends: [{ name: "codex-1", discovery: { ok: false, status: 401, reason: "HTTP 401" } }] }))
+    : new Response(JSON.stringify({ data: [] })));
+  const keyRefused = await runCli(["connect-info"], { ...base, fetchImpl: staleAdapters });
+  assert.equal(keyRefused.result.ready, false);
+  assert.match(keyRefused.result.reason, /^어댑터가 키를 거절합니다 \(codex-1: HTTP 401\)/);
   const refused = await runCli(["connect-info"], { ...base, fetchImpl: router(401, { error: "Unauthorized" }) });
   assert.equal(refused.result.ready, false);
   assert.match(refused.result.reason, /키를 받지 않습니다/);

@@ -211,6 +211,34 @@ test('/v1/models merges every backend and survives a dead one', async (t) => {
   ]);
 });
 
+test('/health says which backend refused the key on model discovery', async (t) => {
+  // An adapter an earlier install left on the port: it answers /health and
+  // refuses this router's key, so it lists nothing.
+  const stale = await startBackend(t, modelsBackend(['gpt-5.5'], { requireAuth: 'old-install-key' }));
+  const good = await startBackend(t, modelsBackend(['claude-opus-5-5']));
+  const url = await startRouter(t, {
+    backends: [
+      { name: 'codex-1', baseUrl: stale.baseUrl, discoverModels: true, apiKeyEnv: 'CODEX_KEY' },
+      { name: 'claude-1', baseUrl: good.baseUrl, discoverModels: true },
+      { name: 'static', baseUrl: 'http://127.0.0.1:1/v1', models: ['x'] },
+    ],
+  }, { env: { CODEX_KEY: 'new-install-key' } });
+
+  const before = await (await fetch(`${url}/health`)).json();
+  assert.equal(before.backends[0].discovery, null, 'nothing is known before the first listing');
+
+  const listed = await (await fetch(`${url}/v1/models`)).json();
+  assert.deepEqual(listed.data.map((entry) => entry.id), ['claude-opus-5-5', 'x']);
+
+  const after = await (await fetch(`${url}/health`)).json();
+  const [codex, claude, fixed] = after.backends;
+  assert.equal(codex.reachable, true, 'the port answers; only the key is refused');
+  assert.deepEqual({ ...codex.discovery, at: null }, { ok: false, status: 401, reason: 'HTTP 401', models: 0, at: null });
+  assert.deepEqual({ ...claude.discovery, at: null }, { ok: true, status: 200, reason: null, models: 1, at: null });
+  assert.equal(fixed.discovery, null, 'a backend with a static list is not discovered');
+  assert.equal(JSON.stringify(after).includes('new-install-key'), false);
+});
+
 test('the merged model list is cached', async (t) => {
   const claude = await startBackend(t, modelsBackend(['claude-opus-5-5']));
   const url = await startRouter(t, {
