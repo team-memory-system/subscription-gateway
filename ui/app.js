@@ -135,7 +135,7 @@ function accountRow(account, siblings, report) {
     buttons.append(button("로그인", "primary", async () => {
       const result = await call("/api/login", { account: account.id });
       if (!result.ok) return say(result.error || "로그인을 시작하지 못했습니다");
-      say(`${accountName(account, report.backends)} 로그인을 브라우저에서 끝내 주세요. 끝나면 알아서 연결합니다.`);
+      startedLogin(account.id, accountName(account, report.backends), result.prompt);
       watchFor(account.id);
     }));
   }
@@ -184,8 +184,8 @@ function renderAccounts(report) {
         await refresh();
         return say(result.error || "계정을 추가하지 못했습니다");
       }
-      say(`${backend.label} 로그인을 브라우저에서 끝내 주세요. 끝나면 알아서 연결합니다.`);
       await refresh();
+      startedLogin(result.account.id, accountName(result.account, report.backends), result.login && result.login.prompt);
       watchFor(result.account.id);
     }));
     target.append(group);
@@ -335,15 +335,153 @@ function watchFor(accountId) {
     if (account && account.login && account.login.loggedIn) {
       clearInterval(polling);
       polling = null;
+      closeLoginPanel(accountId);
       await connectNow();
       return;
     }
+    if (account) updateLoginPanel(accountId, account.pendingLogin);
     if (Date.now() > deadline) {
       clearInterval(polling);
       polling = null;
       say("로그인이 5분 안에 끝나지 않았습니다. 다시 눌러 주세요.");
     }
   }, 3000);
+}
+
+// ------------------------------------------------------------ login panel
+//
+// One login at a time, outside the account rows, so a refresh never wipes what
+// is being typed. On the same computer the browser finishes the login by itself
+// and the panel just closes; from another computer (this screen opened through
+// an ssh tunnel) it is where the sign-in link is, and where the code (Claude) or
+// the address the browser stopped at (Codex) comes back.
+
+const LOGIN_TEXT = {
+  code: {
+    hint: "아래 링크를 열어 로그인하세요. 게이트웨이가 도는 컴퓨터의 브라우저라면 그걸로 끝납니다. 다른 컴퓨터라면 로그인 뒤 나오는 코드를 복사해 붙여 넣으세요.",
+    label: "코드",
+    placeholder: "로그인 페이지에 나온 코드",
+    sent: "코드를 보냈습니다. 확인하는 중입니다…",
+  },
+  callback: {
+    hint: "아래 링크를 열어 로그인하세요. 게이트웨이가 도는 컴퓨터의 브라우저라면 그걸로 끝납니다. 다른 컴퓨터라면 로그인 뒤 브라우저가 열지 못한 localhost:1455 주소를 주소창에서 통째로 복사해 붙여 넣으세요.",
+    label: "브라우저가 멈춘 주소",
+    placeholder: "http://localhost:1455/auth/callback?code=…",
+    sent: "주소를 넘겼습니다. 확인하는 중입니다…",
+  },
+};
+let loginPanel = null;
+
+function buildLoginPanel() {
+  const panel = el("div", "row");
+  panel.id = "login-panel";
+  panel.style.display = "grid";
+  const title = el("div", "name");
+  const hint = el("p", "muted");
+  const link = el("a", "mono");
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.style.wordBreak = "break-all";
+  const form = el("form");
+  const label = el("label");
+  label.htmlFor = "login-input";
+  const input = el("input");
+  input.id = "login-input";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  const send = el("button", "primary", "보내기");
+  send.type = "submit";
+  form.append(label, input, send);
+  const status = el("p", "muted");
+  const cancel = el("button", "", "취소");
+  cancel.type = "button";
+  panel.append(title, hint, link, form, status, cancel);
+  document.getElementById("accounts").after(panel);
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const current = loginPanel;
+    if (!current || !current.kind || !input.value.trim()) return;
+    send.disabled = true;
+    try {
+      const result = current.kind === "code"
+        ? await call("/api/login/code", { account: current.accountId, code: input.value })
+        : await call("/api/login/callback", { account: current.accountId, address: input.value });
+      if (!result.ok) {
+        status.textContent = result.error || "보내지 못했습니다";
+        return;
+      }
+      input.value = "";
+      status.textContent = LOGIN_TEXT[current.kind].sent;
+      watchFor(current.accountId);
+    } finally {
+      send.disabled = false;
+    }
+  });
+  cancel.addEventListener("click", async () => {
+    const current = loginPanel;
+    if (!current) return;
+    if (polling) clearInterval(polling);
+    polling = null;
+    await call("/api/login/cancel", { account: current.accountId });
+    closeLoginPanel(current.accountId);
+    say("");
+  });
+  return { panel, title, hint, link, form, label, input, status };
+}
+
+/** A screen server from before the panel sends no prompt: then only the old notice. */
+function startedLogin(accountId, name, prompt) {
+  if (!prompt) return say(`${name} 로그인을 브라우저에서 끝내 주세요. 끝나면 알아서 연결합니다.`);
+  say("");
+  openLoginPanel(accountId, name, prompt);
+}
+
+function openLoginPanel(accountId, name, prompt) {
+  if (!loginPanel) loginPanel = buildLoginPanel();
+  const view = loginPanel;
+  view.accountId = accountId;
+  view.kind = null;
+  view.panel.hidden = false;
+  view.panel.style.display = "grid";
+  view.title.textContent = `${name} 로그인`;
+  view.input.value = "";
+  view.link.removeAttribute("href");
+  view.link.textContent = "";
+  view.status.textContent = "";
+  updateLoginPanel(accountId, prompt);
+}
+
+function updateLoginPanel(accountId, prompt) {
+  const view = loginPanel;
+  if (!view || view.accountId !== accountId || view.panel.hidden) return;
+  if (prompt && prompt.url && view.link.getAttribute("href") !== prompt.url) {
+    view.link.href = prompt.url;
+    view.link.textContent = prompt.url;
+  }
+  if (!view.link.getAttribute("href")) view.link.textContent = "로그인 주소를 기다리는 중입니다…";
+  // The kind is set once; a refresh that finds the CLI gone must not hide a box mid-typing.
+  if (!view.kind && prompt && prompt.input && LOGIN_TEXT[prompt.input]) {
+    const text = LOGIN_TEXT[prompt.input];
+    view.kind = prompt.input;
+    view.label.textContent = text.label;
+    view.input.placeholder = text.placeholder;
+    view.hint.textContent = text.hint;
+  }
+  view.form.hidden = !view.kind;
+  view.form.style.display = view.kind ? "" : "none";
+  if (!view.kind) view.hint.textContent = "아래 링크를 게이트웨이가 도는 컴퓨터의 브라우저에서 열어 로그인하세요.";
+  if (prompt && prompt.running === false) {
+    view.status.textContent = `로그인이 끝났지만 되지 않았습니다${prompt.message ? `: ${prompt.message}` : ""}. 로그인을 다시 누르세요.`;
+  }
+}
+
+function closeLoginPanel(accountId) {
+  if (!loginPanel || (accountId && loginPanel.accountId !== accountId)) return;
+  loginPanel.panel.hidden = true;
+  loginPanel.panel.style.display = "none";
+  loginPanel.accountId = null;
+  loginPanel.kind = null;
 }
 
 document.getElementById("connect-now").addEventListener("click", async (event) => {

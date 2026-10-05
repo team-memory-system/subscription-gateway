@@ -1,15 +1,26 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import fsp from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { addAccount, moveAccount, portBase, readAccounts, removeAccount, setMode } from "../gateway/accounts.mjs";
-import { authEnvironment, loginStatus } from "../gateway/auth.mjs";
+import {
+  authEnvironment,
+  callbackRequest,
+  callbackTarget,
+  lastOutputLine,
+  loginInput,
+  loginStatus,
+  replayCallback,
+  signInUrl,
+} from "../gateway/auth.mjs";
 import { gatewayPaths } from "../gateway/paths.mjs";
 import { loadSecrets, SECRET_ENV } from "../gateway/secrets.mjs";
 import { adapterService, routerConfig, routerService, serviceEnvironment, startService } from "../gateway/services.mjs";
-import { chatTest, connect, createHandler, createKeeper, requestAllowed, statusReport } from "./server.mjs";
+import { chatTest, connect, createHandler, createKeeper, createLogins, requestAllowed, statusReport } from "./server.mjs";
 
 async function tempPaths(t) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "subscription-gateway-"));
@@ -52,6 +63,231 @@ test("only a loopback browser on this origin sending JSON may drive the screen",
   assert.equal(requestAllowed(fakeRequest({ method: "POST", contentType: "application/json" }), { port }).ok, true);
   // A request forwarded from off-machine is refused even if the Host header lies.
   assert.equal(requestAllowed(fakeRequest({ address: "192.168.1.20" }), { port }).status, 403);
+});
+
+test("through a tunnel on another local port the screen's own page may post, and nothing else may", () => {
+  const post = (host, origin) => requestAllowed(fakeRequest({ method: "POST", url: "/api/login", host, origin, contentType: "application/json" }));
+  // `ssh -L 21450:127.0.0.1:11450`: the browser elsewhere sees localhost:21450, and sshd connects from loopback.
+  assert.equal(post("localhost:21450", "http://localhost:21450").ok, true);
+  assert.equal(post("127.0.0.1:21450", "http://127.0.0.1:21450").ok, true);
+  assert.equal(post("[::1]:21450", "http://[::1]:21450").ok, true);
+  assert.equal(post("127.0.0.1:11450", "http://127.0.0.1:11450").ok, true);
+
+  // Another site.
+  assert.equal(post("127.0.0.1:21450", "https://evil.example").status, 403);
+  assert.equal(post("localhost:21450", "null").status, 403);
+  // Another local port: a page some other local program serves.
+  assert.equal(post("127.0.0.1:11450", "http://127.0.0.1:3000").status, 403);
+  assert.equal(post("localhost:21450", "http://localhost:11450").status, 403);
+  // Same port, other loopback name or scheme: still another origin.
+  assert.equal(post("localhost:21450", "http://127.0.0.1:21450").status, 403);
+  assert.equal(post("127.0.0.1:21450", "https://127.0.0.1:21450").status, 403);
+  // A rebinding name, even when Host and Origin agree.
+  assert.equal(post("gateway.example.com:21450", "http://gateway.example.com:21450").status, 403);
+  assert.equal(post("127.0.0.1.nip.io:21450", "http://127.0.0.1.nip.io:21450").status, 403);
+  // Still loopback connections only, and still JSON only.
+  assert.equal(requestAllowed(fakeRequest({ method: "POST", host: "localhost:21450", origin: "http://localhost:21450", contentType: "application/json", address: "10.0.0.5" })).status, 403);
+  assert.equal(requestAllowed(fakeRequest({ method: "POST", host: "localhost:21450", origin: "http://localhost:21450", contentType: "text/plain" })).status, 415);
+});
+
+const CODEX_SIGN_IN = "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_x&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid&code_challenge=abc&code_challenge_method=S256&state=st4te";
+const CLAUDE_SIGN_IN = "https://claude.com/cai/oauth/authorize?code=true&client_id=c&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=x&code_challenge_method=S256&state=s";
+
+test("a login's sign-in URL is read from what the CLI printed, escapes and all", () => {
+  // codex-cli 0.154, stdout to a file.
+  const codex = `WARNING: proceeding, even though we could not create PATH aliases\nStarting local login server on http://localhost:1455.\nIf your browser did not open, navigate to this URL to authenticate:\n\n${CODEX_SIGN_IN}\n\nOn a remote or headless machine? Use \`codex login --device-auth\` instead.\n`;
+  assert.equal(signInUrl(codex), CODEX_SIGN_IN);
+  // Claude Code 2.1.289 in a terminal wraps it in an OSC 8 hyperlink.
+  const claude = `Opening browser to sign in…\r\nIf the browser didn't open, visit: \u001b]8;;${CLAUDE_SIGN_IN}\u0007${CLAUDE_SIGN_IN}\u001b]8;;\u0007\r\nPaste code here if prompted > `;
+  assert.equal(signInUrl(claude), CLAUDE_SIGN_IN);
+  assert.equal(signInUrl("Starting local login server on http://localhost:1455.\n"), null);
+  assert.equal(signInUrl("javascript:alert(1)//authorize"), null);
+  assert.equal(lastOutputLine(`${claude}Login failed: Request failed with status code 400\n`), "Login failed: Request failed with status code 400");
+  assert.equal(lastOutputLine(codex).includes("http"), false);
+});
+
+test("only the login's own callback address is replayed, and only on this machine", async (t) => {
+  assert.deepEqual(callbackTarget(CODEX_SIGN_IN), { port: 1455, pathname: "/auth/callback" });
+  assert.equal(callbackTarget(CLAUDE_SIGN_IN), null, "Claude's redirect is not on this machine");
+
+  const good = "http://localhost:1455/auth/callback?code=ac_1&scope=openid&state=st4te";
+  assert.deepEqual(callbackRequest(CODEX_SIGN_IN, good), { ok: true, port: 1455, path: "/auth/callback?code=ac_1&scope=openid&state=st4te" });
+  assert.equal(callbackRequest(CODEX_SIGN_IN, "localhost:1455/auth/callback?code=a&state=b").ok, true, "copied without the scheme");
+  assert.equal(callbackRequest(CODEX_SIGN_IN, "http://127.0.0.1:1455/auth/callback?error=access_denied&state=b").ok, true);
+  for (const bad of [
+    "http://localhost:1456/auth/callback?code=a&state=b",
+    "http://localhost:1455/success?code=a&state=b",
+    "http://evil.example:1455/auth/callback?code=a&state=b",
+    "https://localhost:1455/auth/callback?code=a&state=b",
+    "http://localhost:1455/auth/callback?code=a",
+    "http://localhost:1455/auth/callback",
+    "not a url",
+  ]) {
+    assert.equal(callbackRequest(CODEX_SIGN_IN, bad).ok, false, bad);
+  }
+  assert.equal(callbackRequest(CLAUDE_SIGN_IN, good).ok, false);
+
+  // A stand-in for the codex login server: the callback redirects to its success page.
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push({ url: req.url, host: req.headers.host });
+    if (req.url.startsWith("/auth/callback?code=bad")) { res.writeHead(400); return res.end("State mismatch"); }
+    if (req.url.startsWith("/auth/callback")) { res.writeHead(302, { location: `http://localhost:${port}/success?id_token=secret-claims` }); return res.end(); }
+    res.writeHead(200, { "content-type": "text/html" });
+    res.end("<html>Signed in</html>");
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const { port } = server.address();
+  const signIn = CODEX_SIGN_IN.replace("1455", String(port));
+
+  const done = await replayCallback(signIn, `http://localhost:${port}/auth/callback?code=ac_1&state=st4te`);
+  assert.deepEqual(done, { ok: true, status: 302 });
+  assert.deepEqual(seen.map(entry => entry.url), ["/auth/callback?code=ac_1&state=st4te", "/success?id_token=secret-claims"]);
+  assert.equal(seen[0].host, `localhost:${port}`, "the CLI sees the host it redirected to");
+  assert.equal(JSON.stringify(done).includes("secret"), false, "nothing of the success page comes back");
+
+  const refused = await replayCallback(signIn, `http://localhost:${port}/auth/callback?code=bad&state=x`);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.status, 400);
+  assert.equal(refused.error, "State mismatch");
+
+  // A login that is no longer listening.
+  await new Promise(resolve => server.close(resolve));
+  const gone = await replayCallback(signIn, `http://localhost:${port}/auth/callback?code=a&state=b`);
+  assert.equal(gone.ok, false);
+  assert.match(gone.error, /닿지 못했습니다/);
+});
+
+/** A login CLI stand-in: writes what it would print to the log, holds stdin, exits on demand. */
+function fakeLoginStart(printed) {
+  const children = [];
+  const start = async (account, { paths, platform, onSpawn }) => {
+    await fsp.mkdir(paths.logDir, { recursive: true });
+    const logPath = paths.logFile(`login-${account.id}`);
+    await fsp.appendFile(logPath, "an earlier login's output\n");
+    const logOffset = (await fsp.stat(logPath)).size;
+    await fsp.appendFile(logPath, printed[account.backend]);
+    const written = [];
+    const child = Object.assign(new EventEmitter(), {
+      pid: 4000 + children.length,
+      stdin: { write: text => { written.push(text); return true; } },
+      written,
+      kill() { child.killed = true; },
+    });
+    children.push(child);
+    onSpawn(child);
+    return { ok: true, started: true, accountId: account.id, backend: account.backend, pid: child.pid, logPath, logOffset, input: loginInput(account.backend, platform) };
+  };
+  return { start, children };
+}
+
+test("a login started from the screen shows its link and takes back the code or the callback", async (t) => {
+  const { paths } = await tempPaths(t);
+  const codex = await addAccount("codex", { paths, env: {} });
+  const claude = await addAccount("claude", { paths, env: {} });
+  const { start, children } = fakeLoginStart({
+    codex: `If your browser did not open, navigate to this URL to authenticate:\n${CODEX_SIGN_IN}\n`,
+    claude: `If the browser didn't open, visit: ${CLAUDE_SIGN_IN}\nPaste code here if prompted > `,
+  });
+  const killed = [];
+  const replayed = [];
+  const logins = createLogins({
+    paths,
+    env: {},
+    start,
+    platform: "linux",
+    kill: (pid, signal) => killed.push([pid, signal]),
+    replay: async (signIn, address) => { replayed.push({ signIn, address }); return { ok: true, status: 302 }; },
+    sleep: async () => {},
+  });
+
+  const claudeLogin = await logins.begin(claude);
+  assert.equal(claudeLogin.ok, true);
+  assert.deepEqual(
+    { url: claudeLogin.prompt.url, input: claudeLogin.prompt.input, running: claudeLogin.prompt.running },
+    { url: CLAUDE_SIGN_IN, input: "code", running: true },
+  );
+  assert.equal("child" in claudeLogin, false, "the response carries no process");
+  assert.match((await logins.submitCode(claude.id, "")).error, /코드를 그대로/);
+  assert.match((await logins.submitCode(claude.id, "a\nb")).error, /코드를 그대로/);
+  assert.equal((await logins.submitCode(claude.id, "  code123#state456 ")).ok, true);
+  assert.deepEqual(children[0].written, ["code123#state456\n"]);
+  assert.match((await logins.submitCallback(claude.id, "http://localhost:1455/auth/callback?code=a&state=b")).error, /주소를 받지 않습니다/);
+
+  // The CLI refuses the code and exits: the screen says why, and takes nothing more.
+  await fsp.appendFile(paths.logFile("login-claude-1"), "Login failed: Request failed with status code 400\n");
+  children[0].emit("exit", 1, null);
+  const failed = await logins.state(claude.id);
+  assert.equal(failed.running, false);
+  assert.equal(failed.exitCode, 1);
+  assert.equal(failed.input, null);
+  assert.equal(failed.message, "Login failed: Request failed with status code 400");
+  assert.match((await logins.submitCode(claude.id, "again")).error, /다시 누르세요/);
+
+  const codexLogin = await logins.begin(codex);
+  assert.equal(codexLogin.prompt.url, CODEX_SIGN_IN);
+  assert.equal(codexLogin.prompt.input, "callback");
+  assert.match((await logins.submitCode(codex.id, "x")).error, /코드를 받지 않습니다/);
+  const address = "http://localhost:1455/auth/callback?code=ac&state=st4te";
+  assert.deepEqual(await logins.submitCallback(codex.id, address), { ok: true, status: 302 });
+  assert.deepEqual(replayed, [{ signIn: CODEX_SIGN_IN, address }], "replayed against the URL this login printed");
+
+  // Starting again ends the one still waiting, by its process group.
+  await logins.begin(codex);
+  assert.deepEqual(killed, [[-children[1].pid, "SIGTERM"]]);
+  assert.equal(logins.end(codex.id), true);
+  assert.deepEqual(killed[1], [-children[2].pid, "SIGTERM"]);
+  assert.equal(await logins.state(codex.id), null);
+  assert.equal(logins.end(codex.id), false);
+
+  // The status report carries it per account, and the handler's endpoints reach it.
+  const report = await statusReport({ paths, env: {}, fetchImpl: async () => { throw new Error("down"); }, runner: async () => ({ stdout: "{}", stderr: "" }), logins });
+  assert.equal(report.accounts.find(account => account.id === "codex-1").pendingLogin, null);
+  assert.equal(report.accounts.find(account => account.id === "claude-1").pendingLogin.url, CLAUDE_SIGN_IN);
+
+  const handler = createHandler({ paths, env: {}, fetchImpl: async () => { throw new Error("down"); }, port: 11450, logins });
+  const send = async (url, body) => {
+    const res = fakeResponse();
+    await handler(fakeRequest({ method: "POST", url, host: "localhost:21450", origin: "http://localhost:21450", contentType: "application/json", body: JSON.stringify(body) }), res);
+    return { status: res.captured.status, body: JSON.parse(res.captured.body) };
+  };
+  const again = await send("/api/login", { account: "claude-1" });
+  assert.equal(again.status, 200);
+  assert.equal(again.body.prompt.url, CLAUDE_SIGN_IN);
+  assert.equal((await send("/api/login/code", { account: "claude-1", code: "c0de" })).status, 200);
+  assert.deepEqual(children.at(-1).written, ["c0de\n"]);
+  assert.equal((await send("/api/login/callback", { account: "claude-1", address: "x" })).status, 400);
+  assert.deepEqual((await send("/api/login/cancel", { account: "claude-1" })).body, { ok: true, ended: true });
+  assert.equal((await send("/api/login/code", { account: "nobody-1", code: "c" })).status, 400);
+});
+
+test("the screen's login really writes the code to a waiting CLI's stdin", { skip: process.platform === "win32" }, async (t) => {
+  const { root, paths } = await tempPaths(t);
+  const account = await addAccount("claude", { paths, env: {} });
+  // Prints a sign-in URL and a prompt, like `claude auth login`, then writes down the line it reads.
+  const cli = path.join(root, "fake-claude");
+  await fsp.writeFile(cli, [
+    `#!${process.execPath}`,
+    "const fs = require('node:fs');",
+    `process.stdout.write("If the browser didn't open, visit: ${CLAUDE_SIGN_IN}\\nPaste code here if prompted > ");`,
+    "let text = '';",
+    "process.stdin.on('data', chunk => { text += chunk; if (text.includes('\\n')) { fs.writeFileSync(process.env.CLAUDE_CONFIG_DIR + '/got', text); process.stdout.write('Login successful.\\n'); process.exit(0); } });",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  const logins = createLogins({ paths, env: { ...process.env, CLAUDE_BIN: cli } });
+  t.after(() => logins.end(account.id));
+  const begun = await logins.begin(account);
+  assert.equal(begun.ok, true);
+  assert.equal(begun.prompt.url, CLAUDE_SIGN_IN);
+  assert.equal(begun.prompt.input, "code");
+  assert.equal((await logins.submitCode(account.id, "abc#def")).ok, true);
+  const got = path.join(paths.authDir("claude", account.id), "got");
+  const deadline = Date.now() + 10_000;
+  while (!(await fsp.access(got).then(() => true, () => false)) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(await fsp.readFile(got, "utf8"), "abc#def\n");
+  while ((await logins.state(account.id)).running && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal((await logins.state(account.id)).exitCode, 0);
 });
 
 test("the keys are generated once, kept to this user, and never reach a response", async (t) => {

@@ -15,6 +15,7 @@
 // commandInvocation turns the name into the program the shim would run.
 import { execFile, spawn } from "node:child_process";
 import fsp from "node:fs/promises";
+import http from "node:http";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -173,10 +174,38 @@ function shortError(error) {
 }
 
 /**
+ * What the screen can take back from the person to finish a login whose browser
+ * is on another computer:
+ *
+ *   "callback"  Codex. Its sign-in ends by sending the browser to
+ *               http://localhost:1455/auth/callback?code=...&state=..., which is
+ *               the codex process on *this* machine. From another computer that
+ *               page does not load, but its address does; the screen replays it
+ *               here (replayCallback).
+ *   "code"      Claude. Its sign-in page shows a code, which the CLI reads from
+ *               stdin at "Paste code here if prompted >". A pipe is enough: both
+ *               on Linux and on macOS the CLI reads the line and exchanges it.
+ *   null        Claude on Windows, where the login shares the screen's console
+ *               and keeps stdin ignored, as before.
+ *
+ * On the same machine none of it is needed: the CLI opens the browser and its
+ * own localhost callback finishes the login, exactly as before.
+ */
+export function loginInput(backendName, platform = process.platform) {
+  if (backendName === "codex") return "callback";
+  if (backendName === "claude" && platform !== "win32") return "code";
+  return null;
+}
+
+/**
  * Starts a login and returns immediately. The CLI opens a browser and the person
  * finishes there, so this cannot report success; the caller polls `loginStatus`.
  * Output goes to a log file because a detached process with no stdout can wedge
- * a CLI that still tries to print.
+ * a CLI that still tries to print. `logOffset` is where this login's output
+ * starts in that file, which is where its sign-in URL is read from.
+ *
+ * Claude's stdin is a pipe (see loginInput) and `onSpawn` receives the child,
+ * so the caller can write the code to it; every other login keeps stdin ignored.
  *
  * On Windows the login is not detached. A detached process there has no console,
  * so a console program it starts (codex.js starts codex.exe) opens a window of its
@@ -189,26 +218,150 @@ export async function startLogin(account, {
   spawnImpl = spawn,
   platform = process.platform,
   resolve = commandInvocation,
+  onSpawn,
 } = {}) {
   const entry = backend(account.backend);
   await fsp.mkdir(accountDirectory(account, paths), { recursive: true });
   await fsp.mkdir(paths.logDir, { recursive: true });
   const logPath = paths.logFile(`login-${account.id}`);
   const handle = await fsp.open(logPath, "a");
+  const input = loginInput(entry.name, platform);
   try {
+    const logOffset = (await handle.stat()).size;
     const call = resolve(backendBin(entry, env), entry.loginArgs, { env, platform });
     const child = spawnImpl(call.file, call.args, invocationOptions(call, {
       env: authEnvironment(account, { paths, env }),
       detached: platform !== "win32",
-      stdio: ["ignore", handle.fd, handle.fd],
+      stdio: [input === "code" ? "pipe" : "ignore", handle.fd, handle.fd],
     }, platform));
+    // A code written after the CLI has exited must not take the screen down with EPIPE.
+    child.stdin?.on?.("error", () => {});
     child.unref();
-    return { ok: true, started: true, accountId: account.id, backend: account.backend, pid: child.pid ?? null, logPath };
+    onSpawn?.(child);
+    return { ok: true, started: true, accountId: account.id, backend: account.backend, pid: child.pid ?? null, logPath, logOffset, input };
   } catch (error) {
     return { ok: false, started: false, accountId: account.id, backend: account.backend, error: shortError(error) };
   } finally {
     await handle.close();
   }
+}
+
+const ESCAPES = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+const URLS = /https?:\/\/[^\s\u0007\u001b"'<>]+/g;
+
+/** A login's output as text a person could read: no terminal escapes, no carriage returns. */
+export function plainOutput(text) {
+  return String(text || "").replace(ESCAPES, "").replace(/\r/g, "");
+}
+
+/**
+ * The sign-in address a login printed ("If your browser did not open, navigate
+ * to this URL", "If the browser didn't open, visit:"): the first https URL whose
+ * path ends in /authorize. Null until the CLI has printed it.
+ */
+export function signInUrl(output) {
+  for (const candidate of plainOutput(output).match(URLS) || []) {
+    try {
+      const url = new URL(candidate);
+      if (url.protocol === "https:" && /\/authorize$/.test(url.pathname)) return url.href;
+    } catch {
+      // not a URL after all
+    }
+  }
+  return null;
+}
+
+// Claude's prompt. A code read from a pipe is not echoed, so its answer follows on the same line.
+const CODE_PROMPT = /^Paste code here if prompted >\s*/;
+
+/** The last line a login printed, without addresses: why it ended, when it ended badly. */
+export function lastOutputLine(output) {
+  const lines = plainOutput(output).split("\n").map(line => line.replace(URLS, "").replace(CODE_PROMPT, "").trim()).filter(Boolean);
+  return lines.length ? lines[lines.length - 1].slice(0, 300) : "";
+}
+
+const LOOPBACK_NAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** Where a Codex sign-in sends the browser back to, from its redirect_uri: a loopback port and path. */
+export function callbackTarget(signIn) {
+  try {
+    const redirect = new URL(new URL(signIn).searchParams.get("redirect_uri") || "");
+    if (redirect.protocol !== "http:" || !LOOPBACK_NAMES.has(redirect.hostname) || !redirect.port) return null;
+    return { port: Number(redirect.port), pathname: redirect.pathname };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Checks an address the person pasted against the login's own redirect_uri: the
+ * same loopback port and path, with the state the browser came back with. Only
+ * that address is ever requested, and only on this machine's loopback.
+ */
+export function callbackRequest(signIn, pasted) {
+  const target = callbackTarget(signIn);
+  if (!target) return { ok: false, error: "이 로그인은 주소를 받지 않습니다" };
+  let text = String(pasted || "").trim();
+  if (/^(localhost|127\.0\.0\.1|\[::1\])[:/]/i.test(text)) text = `http://${text}`;
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return { ok: false, error: "주소를 읽을 수 없습니다. 브라우저 주소창의 주소를 통째로 붙여 넣으세요" };
+  }
+  if (url.protocol !== "http:" || !LOOPBACK_NAMES.has(url.hostname) || Number(url.port) !== target.port || url.pathname !== target.pathname) {
+    return { ok: false, error: `localhost:${target.port}${target.pathname} 로 시작하는 주소가 아닙니다` };
+  }
+  if (!url.searchParams.get("state") || !(url.searchParams.get("code") || url.searchParams.get("error"))) {
+    return { ok: false, error: "주소에 code 와 state 가 없습니다. 로그인을 끝낸 뒤 주소창의 주소를 붙여 넣으세요" };
+  }
+  return { ok: true, port: target.port, path: `${url.pathname}${url.search}` };
+}
+
+function loopbackGet(port, requestPath, { timeoutMs }) {
+  return new Promise(resolve => {
+    const request = http.get({ host: "127.0.0.1", port, path: requestPath, headers: { host: `localhost:${port}` }, timeout: timeoutMs }, response => {
+      const chunks = [];
+      let size = 0;
+      response.on("data", chunk => { if (size < 16_384) { chunks.push(chunk); size += chunk.length; } });
+      response.on("end", () => resolve({ status: response.statusCode, location: response.headers.location, body: Buffer.concat(chunks).toString("utf8") }));
+      response.on("error", error => resolve({ error: String(error?.message || error) }));
+    });
+    request.on("timeout", () => request.destroy(new Error("timed out")));
+    request.on("error", error => resolve({ error: String(error?.message || error) }));
+  });
+}
+
+function bodyLine(body) {
+  return String(body || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
+/**
+ * Sends the browser's last request again, from here: GET the pasted callback on
+ * 127.0.0.1, where the codex login listens. The CLI then exchanges the code, as
+ * if the browser had reached it. A redirect back to that same server (its
+ * success page, which is when it exits) is followed once. Nothing of the answer
+ * goes back but its status and, on an error, its first words.
+ */
+export async function replayCallback(signIn, pasted, { get = loopbackGet, timeoutMs = 60_000 } = {}) {
+  const checked = callbackRequest(signIn, pasted);
+  if (!checked.ok) return checked;
+  const answer = await get(checked.port, checked.path, { timeoutMs });
+  if (answer.error) return { ok: false, error: `로그인 중인 codex 에 닿지 못했습니다: ${answer.error}` };
+  if (answer.status >= 400) return { ok: false, status: answer.status, error: bodyLine(answer.body) || `HTTP ${answer.status}` };
+  if (answer.status >= 300 && answer.location) {
+    let next = null;
+    try {
+      next = new URL(answer.location, `http://localhost:${checked.port}`);
+    } catch {
+      // an address we will not follow
+    }
+    // Whether the login worked is the CLI's to say (loginStatus); this page only lets it finish.
+    if (next && next.protocol === "http:" && LOOPBACK_NAMES.has(next.hostname) && Number(next.port) === checked.port) {
+      await get(checked.port, `${next.pathname}${next.search}`, { timeoutMs });
+    }
+  }
+  return { ok: true, status: answer.status };
 }
 
 export async function logout(account, {

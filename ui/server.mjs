@@ -19,7 +19,7 @@ import {
   removeAccount,
   setMode,
 } from "../gateway/accounts.mjs";
-import { BACKENDS, loginStatus, logout, startLogin } from "../gateway/auth.mjs";
+import { BACKENDS, lastOutputLine, loginStatus, logout, replayCallback, signInUrl, startLogin } from "../gateway/auth.mjs";
 import { gatewayPaths } from "../gateway/paths.mjs";
 import { loadSecrets, SECRET_ENV } from "../gateway/secrets.mjs";
 import {
@@ -67,19 +67,23 @@ function hostname(value) {
 }
 
 /**
- * Only a browser on this machine, on our own origin, sending JSON. The Origin
- * check is what stops another site's page from posting here; the Host check is
- * what stops a DNS-rebinding name from resolving to us.
+ * Only a loopback connection, to a loopback name, from our own page, sending
+ * JSON. The Host check is what stops a DNS-rebinding name from resolving to us;
+ * the Origin check, that the page is the one this Host served, is what stops
+ * another site's page, or a page on another local port, from posting here.
+ * The port is not fixed: through `ssh -L 21450:127.0.0.1:11450` the browser on
+ * another computer sees this screen at localhost:21450, and its Host and Origin
+ * say so. That ssh connection is still loopback here.
  */
-export function requestAllowed(req, { port }) {
-  const host = hostname(req.headers.host);
+export function requestAllowed(req) {
+  const hostHeader = String(req.headers.host || "").trim().toLowerCase();
+  const host = hostname(hostHeader);
   if (!LOOPBACK_HOSTS.has(host)) return { ok: false, status: 403, error: "loopback only" };
   const address = req.socket?.remoteAddress ? String(req.socket.remoteAddress).replace(/^::ffff:/, "") : "";
   if (address && !LOOPBACK_HOSTS.has(address)) return { ok: false, status: 403, error: "loopback only" };
   const origin = req.headers.origin;
-  if (origin !== undefined) {
-    const allowed = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
-    if (!allowed.has(origin)) return { ok: false, status: 403, error: "cross-origin request refused" };
+  if (origin !== undefined && String(origin).toLowerCase() !== `http://${hostHeader}`) {
+    return { ok: false, status: 403, error: "cross-origin request refused" };
   }
   if (req.method === "POST") {
     const type = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
@@ -105,6 +109,128 @@ async function readJsonBody(req) {
   }
 }
 
+const LOGIN_URL_WAIT_MS = 8_000;
+const LOGIN_OUTPUT_MAX_BYTES = 64 * 1024;
+const LOGIN_CODE_MAX = 2_048;
+
+async function readFrom(file, offset) {
+  const handle = await fsp.open(file, "r");
+  try {
+    const buffer = Buffer.alloc(LOGIN_OUTPUT_MAX_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * The logins this screen started and still holds, one per account, so that a
+ * login whose browser is on another computer can be finished from the screen:
+ * its sign-in URL is read from its own output and shown as a link, Claude's code
+ * goes to its stdin, and Codex's callback address is replayed on this machine.
+ * A login started again, or an account removed, ends the one before it. Lost
+ * when the screen restarts, which ends nothing: the CLI goes on waiting, and a
+ * new login replaces it.
+ */
+export function createLogins({
+  paths = gatewayPaths(),
+  env = process.env,
+  start = startLogin,
+  replay = replayCallback,
+  platform = process.platform,
+  kill = (pid, signal) => process.kill(pid, signal),
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  now = Date.now,
+} = {}) {
+  const active = new Map();
+
+  function end(accountId) {
+    const entry = active.get(accountId);
+    active.delete(accountId);
+    if (!entry || entry.exit !== undefined || !entry.child?.pid) return false;
+    try {
+      // Detached on macOS and Linux, so the CLI leads its own process group:
+      // codex.js and the codex binary it starts go together.
+      if (platform === "win32") entry.child.kill?.();
+      else kill(-entry.child.pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+    return true;
+  }
+
+  async function output(entry) {
+    try {
+      return await readFrom(entry.logPath, entry.logOffset);
+    } catch {
+      return "";
+    }
+  }
+
+  /** What the screen shows about a login in progress. No secret is part of it. */
+  async function state(accountId) {
+    const entry = active.get(accountId);
+    if (!entry) return null;
+    const text = await output(entry);
+    const running = entry.exit === undefined;
+    return {
+      backend: entry.backend,
+      url: signInUrl(text),
+      input: running ? entry.input : null,
+      running,
+      ...(running ? {} : { exitCode: entry.exit, message: lastOutputLine(text) }),
+      startedAt: entry.startedAt,
+    };
+  }
+
+  async function begin(account) {
+    end(account.id);
+    const entry = { backend: account.backend, child: null, input: null, logPath: "", logOffset: 0, startedAt: new Date(now()).toISOString(), exit: undefined };
+    // Listened to as soon as it exists: a CLI that fails at once must not look like one still waiting.
+    const onSpawn = child => {
+      entry.child = child;
+      child?.on?.("exit", (code, signal) => { entry.exit = code ?? signal ?? null; });
+      child?.on?.("error", () => { if (entry.exit === undefined) entry.exit = null; });
+    };
+    const result = await start(account, { paths, env, platform, onSpawn });
+    if (!result.ok) return result;
+    Object.assign(entry, { input: result.input ?? null, logPath: result.logPath, logOffset: result.logOffset ?? 0 });
+    active.set(account.id, entry);
+    // The CLI prints its sign-in URL within a second or two; the screen shows it right away.
+    const deadline = now() + LOGIN_URL_WAIT_MS;
+    let prompt = await state(account.id);
+    while (prompt && !prompt.url && prompt.running && now() < deadline) {
+      await sleep(250);
+      prompt = await state(account.id);
+    }
+    return { ...result, prompt };
+  }
+
+  async function submitCode(accountId, code) {
+    const entry = active.get(accountId);
+    if (!entry || entry.exit !== undefined) return { ok: false, error: "기다리는 로그인이 없습니다. 로그인을 다시 누르세요" };
+    if (entry.input !== "code" || !entry.child?.stdin) return { ok: false, error: "이 로그인은 코드를 받지 않습니다" };
+    const text = String(code || "").trim();
+    if (!text || text.length > LOGIN_CODE_MAX || /[\u0000-\u001f\u007f]/.test(text)) {
+      return { ok: false, error: "로그인 페이지에 나온 코드를 그대로 붙여 넣으세요" };
+    }
+    entry.child.stdin.write(`${text}\n`);
+    return { ok: true };
+  }
+
+  async function submitCallback(accountId, address) {
+    const entry = active.get(accountId);
+    if (!entry || entry.exit !== undefined) return { ok: false, error: "기다리는 로그인이 없습니다. 로그인을 다시 누르세요" };
+    if (entry.input !== "callback") return { ok: false, error: "이 로그인은 주소를 받지 않습니다" };
+    const url = signInUrl(await output(entry));
+    if (!url) return { ok: false, error: "로그인 주소가 아직 없습니다. 잠시 뒤 다시 보내 주세요" };
+    return replay(url, address);
+  }
+
+  return { begin, state, submitCode, submitCallback, end };
+}
+
 /** The router's own view of each account: cooldowns and how much it has been used. */
 function routingByAccount(routerStatus) {
   const backends = routerStatus?.health?.body?.backends;
@@ -124,13 +250,14 @@ export async function statusReport({
   fetchImpl = globalThis.fetch,
   runner,
   secretsLoader = loadSecrets,
+  logins,
 } = {}) {
   const state = await readAccounts({ paths });
   const ask = runner ? { paths, env, runner } : { paths, env };
   const router = routerService(env);
   // The keys first: they are what tells a service of ours from a stale one on its port.
   const { secrets } = await secretsLoader({ paths });
-  const [logins, adapters, routerStatus] = await Promise.all([
+  const [loginStates, adapters, routerStatus] = await Promise.all([
     Promise.all(state.accounts.map(account => loginStatus(account, ask))),
     Promise.all(state.accounts.map(account => serviceStatus(adapterService(account), { paths, fetchImpl, secrets }))),
     serviceStatus(router, { paths, fetchImpl, secrets }),
@@ -142,11 +269,14 @@ export async function statusReport({
     models = { ok: false, reason: "라우터 키가 아직 없습니다" };
   }
   const routing = routingByAccount(routerStatus);
+  const pending = await Promise.all(state.accounts.map(account => (logins ? logins.state(account.id) : null)));
   const accounts = state.accounts.map((account, index) => ({
     ...account,
-    login: logins[index],
+    login: loginStates[index],
     service: adapters[index],
     routing: routing[account.id] || null,
+    // A login this screen started and is still holding: its sign-in URL and what it waits for.
+    pendingLogin: pending[index],
   }));
   // Serving means the router routes to it, not only that its adapter is up: an
   // adapter started after the router is invisible to it until a reconnect.
@@ -406,9 +536,16 @@ export function createKeeper({
   };
 }
 
-export function createHandler({ paths = gatewayPaths(), env = process.env, fetchImpl = globalThis.fetch, port, keeper = createKeeper({ paths, env, fetchImpl }) } = {}) {
+export function createHandler({
+  paths = gatewayPaths(),
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  port,
+  keeper = createKeeper({ paths, env, fetchImpl }),
+  logins = createLogins({ paths, env }),
+} = {}) {
   return async function handler(req, res) {
-    const allowed = requestAllowed(req, { port });
+    const allowed = requestAllowed(req);
     if (!allowed.ok) return json(res, allowed.status, { error: allowed.error });
     const url = new URL(req.url, `http://127.0.0.1:${port}`);
 
@@ -437,7 +574,7 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
 
     try {
       if (req.method === "GET" && url.pathname === "/api/status") {
-        return json(res, 200, await statusReport({ paths, env, fetchImpl }));
+        return json(res, 200, await statusReport({ paths, env, fetchImpl, logins }));
       }
       if (req.method === "POST" && url.pathname === "/api/accounts/add") {
         // Adding an account is only ever done to log into it, so both happen here.
@@ -446,7 +583,7 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
           return json(res, 400, { ok: false, error: `백엔드는 ${BACKENDS.map(entry => entry.name).join(", ")} 중 하나입니다` });
         }
         const account = await addAccount(backendName, { paths, env });
-        const login = await startLogin(account, { paths, env });
+        const login = await logins.begin(account);
         return json(res, login.ok ? 200 : 400, { ok: login.ok, account, login, error: login.error });
       }
       if (req.method === "POST" && url.pathname === "/api/accounts/remove") {
@@ -455,6 +592,7 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
         // What was serving it goes first, then its login, then its directory.
         return await keeper.exclusive(async () => {
           keeper.forget(account.id);
+          logins.end(account.id);
           const stopped = await stopService(adapterService(account), { paths, fetchImpl });
           const loggedOut = await logout(account, { paths, env });
           await removeAccount(account.id, { paths });
@@ -475,8 +613,21 @@ export function createHandler({ paths = gatewayPaths(), env = process.env, fetch
       if (req.method === "POST" && url.pathname === "/api/login") {
         const account = await accountById(body.account, paths);
         if (!account) return json(res, 404, { ok: false, error: "그런 계정이 없습니다" });
-        const result = await startLogin(account, { paths, env });
+        const result = await logins.begin(account);
         return json(res, result.ok ? 200 : 400, result);
+      }
+      // Finishing a login whose browser is on another computer: Claude's code,
+      // Codex's callback address, or giving up on it.
+      if (req.method === "POST" && url.pathname === "/api/login/code") {
+        const result = await logins.submitCode(String(body.account || ""), body.code);
+        return json(res, result.ok ? 200 : 400, result);
+      }
+      if (req.method === "POST" && url.pathname === "/api/login/callback") {
+        const result = await logins.submitCallback(String(body.account || ""), body.address);
+        return json(res, result.ok ? 200 : 400, result);
+      }
+      if (req.method === "POST" && url.pathname === "/api/login/cancel") {
+        return json(res, 200, { ok: true, ended: logins.end(String(body.account || "")) });
       }
       if (req.method === "POST" && url.pathname === "/api/logout") {
         const account = await accountById(body.account, paths);

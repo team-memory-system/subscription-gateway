@@ -188,4 +188,19 @@ test("login status, login and logout run what the shim runs on Windows, and exac
   assert.equal(spawned[0].file, "codex");
   assert.deepEqual(Object.keys(spawned[0].options), ["env", "detached", "stdio"]);
   assert.equal(spawned[0].options.detached, true);
+  assert.equal(spawned[0].options.stdio[0], "ignore", "Codex takes its callback over HTTP, never stdin");
+
+  // Claude reads the code from stdin: a pipe on macOS and Linux, ignored on Windows as before.
+  const claude = await addAccount("claude", { paths, env: {} });
+  spawned.length = 0;
+  for (const platform of ["darwin", "linux"]) {
+    const started = await startLogin(claude, { paths, env: { PATH: "/usr/bin" }, spawnImpl, platform });
+    assert.equal(started.input, "code");
+  }
+  assert.deepEqual(spawned.map(entry => entry.options.stdio[0]), ["pipe", "pipe"]);
+  assert.deepEqual(Object.keys(spawned[0].options), ["env", "detached", "stdio"]);
+  const windowsClaude = await startLogin(claude, { paths, env: WINDOWS_ENV, spawnImpl, platform: "win32", resolve });
+  assert.equal(windowsClaude.input, null);
+  assert.equal(spawned[2].options.stdio[0], "ignore");
+  assert.equal(spawned[2].options.detached, false);
 });
