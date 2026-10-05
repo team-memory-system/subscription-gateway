@@ -141,10 +141,11 @@ consumer terms say the same.
 npm test                                               # all of the below
 cd codex-openai-proxy && node --test server.test.mjs   # 23
 cd claude-print-proxy && node --test server.test.mjs   # 61
-cd router            && node --test server.test.mjs    # 42
-cd ui                && node --test server.test.mjs    # 13
+cd router            && node --test server.test.mjs    # 43
+cd ui                && node --test server.test.mjs    # 20
 node --test gateway/command.test.mjs                   # 7
 node --test gateway/cli.test.mjs                       # 18 (3 skip on a Windows host)
+node --test gateway/services.test.mjs                  # 9
 python3 -m unittest test_proxyctl.py                   # 5
 ```
 
@@ -237,6 +238,44 @@ installing shell's environment is copied.
 | Linux | `systemd` | `~/.config/systemd/user/subscription-gateway-ui.service` with `Restart=always` and `KillMode=process` (the router and adapters outlive a restart of the screen). Needs a working `systemctl --user`; `loginctl enable-linger` makes it start without a login session |
 
 None of them needs admin rights.
+
+## Logging in from another computer
+
+The screen listens on loopback only. A gateway on a computer without a screen,
+such as a server, is reached through an ssh tunnel. The local port is a different
+one, because the local computer may run its own screen on 11450:
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes -L 21450:127.0.0.1:11450 <server>
+# then open http://localhost:21450/ in the local browser
+```
+
+The login itself runs on the server, so the browser's part comes back to the screen
+by hand:
+
+- **The sign-in link is shown on the screen.** The server has no browser to open,
+  so `POST /api/login` returns a `prompt`, and the screen shows the CLI's own
+  sign-in URL in a panel below the account list.
+- **Codex** ends the sign-in by sending the browser to
+  `http://localhost:1455/auth/callback?…`. On the local computer that page does
+  not load, which is expected.
+  - Paste that whole address into the panel. The screen replays it, on its own
+    machine, to the port and path the login printed (`POST /api/login/callback`).
+  - It follows one redirect back to the same server and reports only the status.
+  - An address for any other port or path is refused before anything is sent.
+- **Claude** shows a code after the sign-in. Paste it into the panel, and the screen
+  writes it to the CLI's stdin (`POST /api/login/code`). On macOS and Linux the
+  Claude login gets a stdin pipe for this; a pseudo-terminal is not needed. On
+  Windows its login still shares the screen's console, so it still needs a browser
+  on the same computer.
+- **취소** (`POST /api/login/cancel`) ends a waiting login and its process group.
+  A screen that restarts forgets a waiting login; click 로그인 again.
+
+**The page itself still has to be same-origin.** A POST must carry an `Origin`
+equal to `http://<Host>`, with Host a loopback name and any port. This keeps
+another site's page and a DNS-rebinding name out, as before, while letting a
+tunnel use any local port. The loopback-socket check and the JSON check are
+unchanged.
 
 ## Windows
 
