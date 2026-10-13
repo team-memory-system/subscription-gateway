@@ -499,7 +499,15 @@ export function buildToolEmulation(bodyTools, toolChoice) {
     additionalProperties: false,
   };
 
-  const sections = ['# Available tools', '', 'You can call the following tools.', ''];
+  // These tools exist only on the caller's side. Listed as "you can call", Sonnet
+  // and Haiku called them by name as real tools; the CLI answered "No such tool"
+  // and every such call spent one of the run's few turns.
+  const sections = [
+    '# Tools on the caller\'s side',
+    '',
+    'These tools are not available to you as real tools: calling one by name fails. To use one, ask for it in "tool_calls" of your answer (see Response format); the caller runs it and sends you the result.',
+    '',
+  ];
   for (const tool of tools) {
     sections.push(`## ${tool.name}`);
     if (tool.description) sections.push(tool.description);

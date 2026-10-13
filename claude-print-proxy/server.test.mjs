@@ -372,6 +372,9 @@ test('tools request builds a tool-call json schema and maps structured_output', 
     assert.match(systemPrompt, /Look up current weather\./);
     assert.match(systemPrompt, /"city"/);
     assert.match(systemPrompt, /## get_time/);
+    // Said to be callable, Sonnet and Haiku called these by name and lost turns.
+    assert.match(systemPrompt, /not available to you as real tools/);
+    assert.doesNotMatch(systemPrompt, /You can call the following tools/);
 
     assert.equal(json.choices[0].finish_reason, 'tool_calls');
     assert.equal(json.choices[0].message.content, null);

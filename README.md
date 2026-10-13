@@ -134,6 +134,11 @@ consumer terms say the same.
   Claude adapter now tells the model to call the tool and allows that second turn.
   `claude -p --output-format stream-json --verbose` shows each turn when a 502
   needs explaining.
+- **A tool the caller lists is not a real tool.** The Claude adapter describes
+  the caller's tools in the system prompt. Told it "can call" them, Sonnet 5.5
+  and Haiku 4.5 called them by name; the CLI refused each call and the run ran
+  out of turns, a 502 in about two of three memory questions on 2026-10-13. The
+  prompt now says they are asked for through `tool_calls`.
 
 ### Verify a change
 

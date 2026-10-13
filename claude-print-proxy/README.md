@@ -31,6 +31,12 @@ set PORT=11446 for the managed configuration.
   and gets a second turn (`--max-turns 2`) for the CLI to ask again if the model
   still writes the JSON as text. Without both, a caller prompt like "Return
   exactly one JSON object" made Sonnet 5.5 fail 20 of 28 requests with a 502.
+- OpenAI tools are listed in the system prompt as tools on the caller's side,
+  asked for through `tool_calls`. Listed as tools the model "can call", Sonnet
+  5.5 and Haiku 4.5 called them by name as real tools; the CLI answered "No such
+  tool" and each such call spent a turn. On a memory-agent prompt with seven
+  tools, Sonnet did that in 2 of 3 runs; with the current wording both models
+  asked through `tool_calls` in 16 of 16.
 - Streaming is buffered: complete result, then SSE chunks and DONE.
 - CLI settings discovery, MCP, conversation persistence and built-in tools are
   disabled. Image requests enable only Read in a private request directory.
