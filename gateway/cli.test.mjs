@@ -13,7 +13,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { launchAgent, renderPlist, RUN_KEY, RUN_VALUE, SYSTEMD_UNIT } from "./autostart.mjs";
+import { launchAgent, renderPlist, RUN_KEY, RUN_VALUE, SYSTEMD_UNIT, systemdUnit } from "./autostart.mjs";
 import { openInBrowser, runCli } from "./cli.mjs";
 import { createKeeper } from "../ui/server.mjs";
 import { gatewayPaths, sourceRoot } from "./paths.mjs";
@@ -194,8 +194,10 @@ test("the LaunchAgent is byte for byte what proxyctl.py install ui writes", POSI
   if (!python) return t.skip("python3 is not installed");
   const dir = await tempDir(t);
   const bin = await fakeBin(path.join(dir, "bin"), ["node", "codex", "claude"]);
+  // cmux's own wrappers come first on the PATH it starts; both installers look past them.
+  const shims = await fakeBin(path.join(dir, ".cmuxterm", "cmux-cli-shims", "4B1C86CF"), ["claude", "codex"]);
   const home = path.join(dir, "home");
-  const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home };
+  const env = { PATH: `${shims}:${bin}:/usr/bin:/bin`, HOME: home };
   // Every Mac has this folder; proxyctl.py assumes it.
   await fsp.mkdir(path.join(home, "Library", "LaunchAgents"), { recursive: true });
   const script = [
@@ -213,6 +215,23 @@ test("the LaunchAgent is byte for byte what proxyctl.py install ui writes", POSI
   const written = await fsp.readFile(path.join(home, "Library", "LaunchAgents", "subscription-gateway.ui.plist"), "utf8");
   const agent = launchAgent({ env: { PATH: env.PATH }, root: sourceRoot(), home, uiPort: 11450 });
   assert.equal(agent.text, written);
+});
+
+test("cmux's own claude and codex, first on the installer's PATH, are looked up past", async (t) => {
+  const dir = await tempDir(t);
+  const shims = await fakeBin(path.join(dir, ".cmuxterm", "cmux-cli-shims", "4B1C86CF"), ["claude", "codex", "node"]);
+  const bin = await fakeBin(path.join(dir, "bin"), ["node", "codex", "claude"]);
+  const home = path.join(dir, "home");
+  const env = { PATH: `${shims}:${dir}/.cmuxterm/cmux-cli-shims:${bin}:/usr/bin:/bin` };
+  const agent = launchAgent({ env, root: sourceRoot(), home, uiPort: 11450 });
+  assert.equal(agent.data.EnvironmentVariables.PATH, `${bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`);
+  assert.equal(agent.data.ProgramArguments[0], path.join(bin, "node"));
+  const unit = systemdUnit({ env, root: sourceRoot(), home, uiPort: 11450 });
+  assert.match(unit.text, new RegExp(`^Environment="PATH=${bin}:/usr/local/bin:/usr/bin`, "m"));
+  assert.doesNotMatch(unit.text, /cmux-cli-shims/);
+  // Only that folder: one merely named like it is a folder like any other.
+  const near = await fakeBin(path.join(dir, "cmux-cli-shims-backup"), ["claude"]);
+  assert.ok(launchAgent({ env: { PATH: `${near}:${bin}` }, root: sourceRoot(), home, uiPort: 11450 }).data.EnvironmentVariables.PATH.split(":").includes(near));
 });
 
 test("install on macOS refuses next to proxyctl's single-account router, before touching anything", async (t) => {

@@ -84,6 +84,22 @@ class InstallTest(unittest.TestCase):
         self.assertIn('/usr/bin', variables['PATH'].split(':'))
         self.assertEqual(urlopen.call_args.args[0], 'http://127.0.0.1:11450/health')
 
+    def test_cmux_wrappers_first_on_path_are_looked_up_past(self):
+        # cmux's own claude works only inside its terminal: started by launchd, every
+        # Claude account would look logged out.
+        root = Path(self.temp.name)
+        shims = root / '.cmuxterm' / 'cmux-cli-shims' / '4B1C86CF'
+        real = root / 'bin'
+        for folder, tools in ((shims, ('claude', 'codex')), (real, ('node', 'codex', 'claude'))):
+            folder.mkdir(parents=True)
+            for tool in tools:
+                (folder / tool).write_text('#!/bin/sh\n')
+                (folder / tool).chmod(0o755)
+        with patch.dict(proxyctl.os.environ, {'PATH': f'{shims}:{real}:/usr/bin:/bin'}, clear=True):
+            folders = proxyctl.service_path().split(':')
+        self.assertEqual(folders[0], str(real))
+        self.assertNotIn(str(shims), folders)
+
     def test_the_screen_and_the_single_account_router_are_never_installed_together(self):
         self.assertNotIn('ui', proxyctl.ALL)
         router = proxyctl.AGENTS / (proxyctl.SERVICES['router'][0] + '.plist')

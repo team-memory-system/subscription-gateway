@@ -16,7 +16,8 @@
 // not inherited from whoever ran the installer: its port, PATH built from where
 // node, codex and claude are plus the system's folders, and the gateway's own
 // overrides (CARRIED_ENV) when the installer was given any. Session variables
-// of the installing shell are never copied.
+// of the installing shell are never copied, and neither are a terminal's own
+// wrappers for those tools (SESSION_SHIMS).
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -33,6 +34,11 @@ export const SYSTEMD_UNIT = "subscription-gateway-ui.service";
 const LAUNCHD_SYSTEM_PATH = Object.freeze(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]);
 const SYSTEMD_SYSTEM_PATH = Object.freeze(["/usr/local/bin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/sbin", "/sbin"]);
 const LAUNCHCTL = "/bin/launchctl";
+// cmux puts a folder of its own claude and codex, ~/.cmuxterm/cmux-cli-shims/<session>,
+// first on every PATH it starts. They work only inside that terminal: started by
+// launchd, `claude auth status` fails and every Claude account looks logged out.
+// The folder is gone after the session, too. The tools are looked up past it.
+const SESSION_SHIMS = /(?:^|\/)cmux-cli-shims(?:\/|$)/;
 
 // Overrides the gateway reads, carried into the autostart when the installer was
 // run with them, so the screen started at logon uses the directory and ports
@@ -78,8 +84,14 @@ export function whichPosix(tool, env = process.env) {
   return null;
 }
 
+/** The installing shell's PATH without a terminal's own wrappers (SESSION_SHIMS). */
+function lookupEnvironment(env) {
+  return { ...env, PATH: String(env.PATH || "").split(":").filter(folder => !SESSION_SHIMS.test(folder)).join(":") };
+}
+
 function toolFolders(env, which) {
-  return ["node", "codex", "claude"].map(tool => which(tool, env)).filter(Boolean).map(file => path.dirname(file));
+  const lookup = lookupEnvironment(env);
+  return ["node", "codex", "claude"].map(tool => which(tool, lookup)).filter(Boolean).map(file => path.dirname(file));
 }
 
 // ------------------------------------------------------------------ launchd
@@ -133,7 +145,7 @@ export function launchAgent({ env = process.env, root, home, uiPort, execPath = 
       ...screenEnvironment(env, uiPort),
     },
     Label: label,
-    ProgramArguments: [which("node", env) || execPath, path.join(root, "ui", "server.mjs")],
+    ProgramArguments: [which("node", lookupEnvironment(env)) || execPath, path.join(root, "ui", "server.mjs")],
     WorkingDirectory: path.join(root, "ui"),
     StandardOutPath: path.join(stateDir, "logs", "ui.log"),
     StandardErrorPath: path.join(stateDir, "logs", "ui.error.log"),
@@ -362,7 +374,7 @@ export function systemdUnit({ env = process.env, root, home, uiPort, execPath = 
     "[Service]",
     "Type=simple",
     `WorkingDirectory=${path.join(root, "ui").replace(/%/g, "%%")}`,
-    `ExecStart=${[which("node", env) || execPath, path.join(root, "ui", "server.mjs")].map(part => systemdQuote(part, { exec: true })).join(" ")}`,
+    `ExecStart=${[which("node", lookupEnvironment(env)) || execPath, path.join(root, "ui", "server.mjs")].map(part => systemdQuote(part, { exec: true })).join(" ")}`,
     ...Object.keys(variables).sort().map(name => `Environment=${systemdQuote(`${name}=${variables[name]}`)}`),
     "Restart=always",
     "RestartSec=5",

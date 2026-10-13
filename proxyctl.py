@@ -36,11 +36,18 @@ EXCLUSIVE = {'ui': 'router', 'router': 'ui'}
 def port_variable(name):
     return 'GATEWAY_UI_PORT' if name == 'ui' else 'PORT'
 
+def tool_search_path():
+    """The installing shell's PATH without a terminal's own wrappers for the tools:
+    cmux puts ~/.cmuxterm/cmux-cli-shims/<session> first, whose claude and codex
+    work only inside that terminal (gateway/autostart.mjs SESSION_SHIMS)."""
+    folders = os.environ.get('PATH', '').split(os.pathsep)
+    return os.pathsep.join(folder for folder in folders if 'cmux-cli-shims' not in Path(folder).parts)
+
 def service_path():
     """PATH for launchd: where node, codex and claude are, then the system's. Not
     the installing shell's PATH, which can carry a terminal's per-session
     directories that are gone by the next login."""
-    found = [shutil.which(tool) for tool in ('node', 'codex', 'claude')]
+    found = [shutil.which(tool, path=tool_search_path()) for tool in ('node', 'codex', 'claude')]
     folders = [str(Path(tool).parent) for tool in found if tool]
     folders += ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin']
     return ':'.join(dict.fromkeys(folders))
@@ -80,7 +87,7 @@ def install(name):
         data = {'RunAtLoad': True, 'KeepAlive': True, 'EnvironmentVariables': environment}
         if name == 'claude':
             data['EnvironmentVariables']['CLAUDE_BIN'] = shutil.which('claude') or 'claude'
-    data.update(Label=label, ProgramArguments=[shutil.which('node') or '/opt/homebrew/bin/node', str(ROOT/directory/'server.mjs')],
+    data.update(Label=label, ProgramArguments=[shutil.which('node', path=tool_search_path()) or '/opt/homebrew/bin/node', str(ROOT/directory/'server.mjs')],
                 WorkingDirectory=str(ROOT/directory), StandardOutPath=str(STATE/'logs'/f'{name}.log'),
                 StandardErrorPath=str(STATE/'logs'/f'{name}.error.log'))
     # Preserve existing OAuth source and shared keys; never copy credentials into the repository.
