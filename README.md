@@ -7,14 +7,14 @@ WeKnora, and other applications can use its API.
 ## Read this first (for agents)
 
 One of three repositories in the memory system. The gateway owns its processes,
-logins, and per-user autostart: `honcho-agent-bridge` downloads a pinned source
+logins, and per-user autostart: `team-memory` downloads a pinned source
 revision and calls the gateway's own installation CLI. The gateway can also be
 installed and used on its own.
 
 | Repository | What it is | Installed where |
 |---|---|---|
 | [`honcho-selfhost`](https://github.com/team-memory-system/honcho-selfhost) | The memory server, a fork of `plastic-labs/honcho` (AGPL-3.0) | One computer per person |
-| [`honcho-agent-bridge`](https://github.com/team-memory-system/honcho-agent-bridge) | Collector, installer, agent plugin | Every machine that runs an agent |
+| [`team-memory`](https://github.com/team-memory-system/team-memory) | Collector, installer, agent plugin | Every machine that runs an agent |
 | **`subscription-gateway`** (this one) | Reusable subscription-to-API adapters and a router | Any computer that needs a subscription-backed API; the Honcho server's computer when used by Team Memory System |
 
 ### Why these cannot move into Docker
@@ -34,7 +34,7 @@ Three things can, and they are separate:
 - `proxyctl.py` — macOS LaunchAgents, `subscription-gateway.*`. This is what runs
   on the owner's machine today. It preserves an existing plist's OAuth source and
   shared keys, and never copies credentials into this repository.
-- `honcho-agent-bridge`'s `scripts/host-manager.mjs` — cross-platform, spawns a
+- `team-memory`'s `scripts/host-manager.mjs` — cross-platform, spawns a
   supervisor detached that keeps all three alive. It needs `llmProxyRoot` in its host
   profile to point at this checkout. It registers nothing with the OS, so nothing
   restarts them after a reboot.
@@ -54,7 +54,7 @@ install `ui` next to its own `router`, since both run a router on 11400, and so 
 
 ### Installing it from another program
 
-`gateway/cli.mjs` is the interface for installers (honcho-agent-bridge's included):
+`gateway/cli.mjs` is the interface for installers (team-memory's included):
 `install`, `uninstall`, `status`, `connect-info`, `open`, each printing one JSON
 object. It needs only Node. `connect-info` prints the router's client key, and is
 the only command that prints a secret.
