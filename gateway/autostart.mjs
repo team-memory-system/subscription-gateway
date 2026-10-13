@@ -192,15 +192,26 @@ async function installLaunchd(ctx) {
   const domain = `gui/${ctx.uid}`;
   const target = `${domain}/${agent.label}`;
   const loaded = (await ctx.run(LAUNCHCTL, ["print", target])).code === 0;
-  // An unchanged agent that launchd already runs is left alone: KeepAlive keeps it
+  // A bootstrap should start a RunAtLoad agent, but on a clean MacBook (2026-10-13)
+  // launchd loaded this one and never ran it (runs = 0). A kickstart starts a loaded
+  // agent that is not running and leaves a running one alone, so it follows every
+  // bootstrap. Whether the screen came up is what install's health check finds out.
+  const kickstart = () => ctx.run(LAUNCHCTL, ["kickstart", target]);
+  // An unchanged agent that launchd already has is not reloaded: KeepAlive keeps it
   // up, and a reload would restart the router for nothing.
-  if (loaded && !changed) return { changed, started: false, logHint: agent.logHint };
+  if (loaded && !changed) {
+    await kickstart();
+    return { changed, started: false, logHint: agent.logHint };
+  }
   if (loaded) await ctx.run(LAUNCHCTL, ["bootout", target]);
   let result;
   // Right after a bootout, launchd can refuse a bootstrap for a moment (error 5).
   for (let attempt = 0; attempt < 5; attempt += 1) {
     result = await ctx.run(LAUNCHCTL, ["bootstrap", domain, agent.plistPath]);
-    if (result.code === 0) return { changed, started: true, logHint: agent.logHint };
+    if (result.code === 0) {
+      await kickstart();
+      return { changed, started: true, logHint: agent.logHint };
+    }
     await ctx.sleep(1_000);
   }
   throw new Error(`launchctl bootstrap 가 실패했습니다: ${firstLine(result.stderr || result.stdout) || `exit ${result.code}`}`);

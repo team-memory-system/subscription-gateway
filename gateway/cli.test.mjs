@@ -162,15 +162,17 @@ test("install on macOS: npm ci, keys, the LaunchAgent proxyctl.py writes, starte
   for (const leak of ["TERM_SESSION_ID", "SSH_AUTH_SOCK", "session-shims"]) assert.equal(text.includes(leak), false, leak);
   assert.deepEqual(
     run.calls.filter(call => call.file === "/bin/launchctl").map(call => call.args),
-    [["print", "gui/501/subscription-gateway.ui"], ["bootstrap", "gui/501", plistPath]],
+    // The kickstart: a clean MacBook (2026-10-13) loaded the agent and never ran it.
+    [["print", "gui/501/subscription-gateway.ui"], ["bootstrap", "gui/501", plistPath], ["kickstart", "gui/501/subscription-gateway.ui"]],
   );
 
-  // Again: nothing to install, nothing changed, and launchd is not bothered.
+  // Again: nothing to install and nothing changed. launchd only gets a kickstart,
+  // which starts the screen if it is not running and leaves it alone if it is.
   run.calls.length = 0;
   const again = await runCli(["install"], deps);
   assert.equal(again.code, 0);
   assert.deepEqual(again.result, result);
-  assert.deepEqual(run.calls.map(call => [path.basename(call.file), call.args[0]]), [["launchctl", "print"]]);
+  assert.deepEqual(run.calls.map(call => [path.basename(call.file), call.args[0]]), [["launchctl", "print"], ["launchctl", "kickstart"]]);
 
   // A different port is a different agent: it is reloaded.
   run.calls.length = 0;
@@ -179,7 +181,7 @@ test("install on macOS: npm ci, keys, the LaunchAgent proxyctl.py writes, starte
     throw new Error("refused");
   } });
   assert.equal(moved.result.uiUrl, "http://127.0.0.1:11451");
-  assert.deepEqual(run.calls.map(call => call.args[0]), ["print", "bootout", "bootstrap"]);
+  assert.deepEqual(run.calls.map(call => call.args[0]), ["print", "bootout", "bootstrap", "kickstart"]);
 });
 
 test("the LaunchAgent is byte for byte what proxyctl.py install ui writes", POSIX_HOST, async (t) => {

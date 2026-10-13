@@ -237,7 +237,10 @@ installing shell's environment is copied.
 | Windows | `windows-run` | the value `SubscriptionGateway` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, which runs `wscript.exe //B //NoLogo <app>\autostart\ui.vbs`; see [Windows](#windows) |
 | Linux | `systemd` | `~/.config/systemd/user/subscription-gateway-ui.service` with `Restart=always` and `KillMode=process` (the router and adapters outlive a restart of the screen). Needs a working `systemctl --user`; `loginctl enable-linger` makes it start without a login session |
 
-None of them needs admin rights.
+None of them needs admin rights. On macOS `install` runs `launchctl kickstart`
+after every bootstrap, and on an unchanged agent too: a clean MacBook (2026-10-13)
+loaded the agent and never ran it (`runs = 0` in `launchctl print`). A kickstart
+leaves a running screen alone.
 
 ## Logging in from another computer
 
